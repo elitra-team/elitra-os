@@ -8,6 +8,7 @@ pub fn init_procfs() {
         create_proc_dev(b"/proc/uptime\0".as_ptr(), read_uptime);
         create_proc_dev(b"/proc/version\0".as_ptr(), read_version);
         create_proc_dev(b"/proc/stat\0".as_ptr(), read_stat);
+        create_proc_dev(b"/proc/pci\0".as_ptr(), read_pci);
     }
 }
 
@@ -160,6 +161,47 @@ extern "C" fn read_stat(_node: *mut VNode, buf: *mut u8, size: u32, _offset: u32
     }
 }
 
+extern "C" fn read_pci(_node: *mut VNode, buf: *mut u8, size: u32, _offset: u32) -> i32 {
+    unsafe {
+        let mut out = [0u8; 4096];
+        let mut pos = 0;
+        append_str(&mut out, &mut pos, b"Bus  Dev  Func  Vendor  Device  Class\n\0");
+
+        for bus in 0..=255u8 {
+            for dev in 0..32u8 {
+                for func in 0..8u8 {
+                    let vendor = crate::pci::PCI::config_read_word(bus, dev, func, 0x00);
+                    if vendor == 0xFFFF { continue; }
+                    let device = crate::pci::PCI::config_read_word(bus, dev, func, 0x02);
+                    let class_reg = crate::pci::PCI::config_read_dword(bus, dev, func, 0x08);
+                    let class = (class_reg >> 24) as u8;
+                    let subclass = (class_reg >> 16) as u8;
+
+                    append_u32_hex(&mut out, &mut pos, bus as u32);
+                    append_str(&mut out, &mut pos, b"  \0");
+                    append_u32_hex(&mut out, &mut pos, dev as u32);
+                    append_str(&mut out, &mut pos, b"  \0");
+                    append_u32_hex(&mut out, &mut pos, func as u32);
+                    append_str(&mut out, &mut pos, b"     \0");
+                    append_u32_hex(&mut out, &mut pos, vendor as u32);
+                    append_str(&mut out, &mut pos, b"  \0");
+                    append_u32_hex(&mut out, &mut pos, device as u32);
+                    append_str(&mut out, &mut pos, b"  \0");
+                    append_u32_hex(&mut out, &mut pos, ((class as u32) << 8) | (subclass as u32));
+                    append_str(&mut out, &mut pos, b"\n\0");
+                }
+            }
+        }
+        let len = core::cmp::min(pos, size as usize);
+        let mut i = 0;
+        while i < len {
+            core::ptr::write_volatile(buf.add(i), out[i]);
+            i += 1;
+        }
+        len as i32
+    }
+}
+
 pub fn proc_list_processes(buf: &mut [u8]) -> usize {
     unsafe {
         let mut pos = 0;
@@ -214,7 +256,7 @@ pub fn proc_list_processes(buf: &mut [u8]) -> usize {
     }
 }
 
-fn append_str(buf: &mut [u8], pos: &mut usize, s: &[u8]) {
+pub fn append_str(buf: &mut [u8], pos: &mut usize, s: &[u8]) {
     let mut i = 0;
     while i < s.len() && *pos < buf.len() {
         buf[*pos] = s[i];
@@ -223,7 +265,7 @@ fn append_str(buf: &mut [u8], pos: &mut usize, s: &[u8]) {
     }
 }
 
-fn append_u32(buf: &mut [u8], pos: &mut usize, val: u32) {
+pub fn append_u32(buf: &mut [u8], pos: &mut usize, val: u32) {
     if val == 0 {
         if *pos < buf.len() { buf[*pos] = b'0'; *pos += 1; }
         return;
@@ -258,4 +300,23 @@ fn write_padded_u32(buf: &mut [u8], start: usize, val: u32, width: usize) -> usi
         written += 1;
     }
     written
+}
+
+fn append_u32_hex(buf: &mut [u8], pos: &mut usize, val: u32) {
+    if val == 0 {
+        if *pos + 2 <= buf.len() { buf[*pos] = b'0'; buf[*pos + 1] = b'0'; *pos += 2; }
+        return;
+    }
+    let hex = b"0123456789abcdef";
+    let mut tmp = [0u8; 8];
+    let mut n = 0;
+    let mut v = val;
+    while v > 0 { tmp[n] = hex[(v & 0xF) as usize]; v >>= 4; n += 1; }
+    // Pad to at least 2 digits
+    if n < 2 { n = 2; }
+    let mut i = n;
+    while i > 0 {
+        i -= 1;
+        if *pos < buf.len() { buf[*pos] = tmp[i]; *pos += 1; }
+    }
 }

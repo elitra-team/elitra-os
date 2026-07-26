@@ -157,6 +157,46 @@ unsafe fn cow_resolve(addr: u64, _err: u64) -> bool {
     true
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn cow_resolve_page(target_cr3: u64, addr: u64) -> bool {
+    let p4 = target_cr3 as *mut u64;
+    let i4 = pml4_i(addr) as usize;
+    let i3 = pdp_i(addr) as usize;
+    let i2 = pd_i(addr) as usize;
+    let i1 = pt_i(addr) as usize;
+
+    if (*p4.add(i4) & 1) == 0 { return false; }
+    let p3 = (*p4.add(i4) & PTE_MASK) as *mut u64;
+    if (*p3.add(i3) & 1) == 0 { return false; }
+    let p2 = (*p3.add(i3) & PTE_MASK) as *mut u64;
+    if (*p2.add(i2) & 1) == 0 { return false; }
+    if (*p2.add(i2) & PS_2MB) != 0 { return false; }
+    let p1 = (*p2.add(i2) & PTE_MASK) as *mut u64;
+    let ent = *p1.add(i1);
+    if (ent & 1) == 0 { return false; }
+    if (ent & COW_BIT) == 0 { return false; }
+
+    let phys = ent & PTE_MASK;
+    let frame = (phys / 4096) as u32;
+    let refs = krust_cow_refdec(frame);
+
+    if refs == 0 {
+        let new_flags = (ent & FLAGS_MASK) & !COW_BIT;
+        let new_flags = new_flags | 0x2;
+        *p1.add(i1) = (phys & PTE_MASK) | (new_flags & FLAGS_MASK) | 1;
+        core::arch::asm!("invlpg [{}]", in(reg) addr);
+        return true;
+    }
+
+    let new_frame = krust_pmm_alloc_frame();
+    if new_frame == !0usize { return false; }
+    let new_page = (new_frame * 4096) as *mut u8;
+    memcpy(new_page, phys as *const u8, 4096);
+    *p1.add(i1) = ((new_page as u64) & PTE_MASK) | 0x7;
+    core::arch::asm!("invlpg [{}]", in(reg) addr);
+    true
+}
+
 unsafe fn vma_lazy_alloc(addr: u64, err: u64) -> bool {
     let t = krust_sched_current();
     if t.is_null() || (*t).vma_list.is_null() { return false; }

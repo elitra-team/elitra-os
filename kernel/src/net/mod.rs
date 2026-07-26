@@ -466,43 +466,65 @@ pub fn net_accept(sockfd: i32, client_ip: *mut u8, client_port: *mut u16) -> i32
     } else {
         return -1;
     }
+    let listen_port = if let Some(ref sock) = socks[sockfd as usize] {
+        match sock.local_addr {
+            Some(ref local) => local.port_be(),
+            None => return -1,
+        }
+    } else {
+        return -1;
+    };
+    drop(socks);
+
     let mut conns = tcp_connections();
-    for (_idx, conn_opt) in conns.iter().enumerate() {
-        if let Some(ref conn) = conn_opt {
-            if conn.state == tcp::TcpState::Established {
-                if let Some(ref local) = socks[sockfd as usize].as_ref().unwrap().local_addr {
-                    if local.port_be() == u16::from_be(conn.local_addr.port) {
-                        unsafe {
-                            if !client_ip.is_null() {
-                                for i in 0..4u64 {
-                                    core::ptr::write_volatile(client_ip.add(i as usize), conn.remote_addr.ip[i as usize]);
-                                }
-                            }
-                            if !client_port.is_null() {
-                                core::ptr::write_volatile(client_port, u16::from_be(conn.remote_addr.port));
-                            }
+    for conn_opt in conns.iter_mut() {
+        if let Some(ref mut conn) = conn_opt {
+            if conn.state == tcp::TcpState::Established
+                && u16::from_be(conn.local_addr.port) == listen_port
+            {
+                let c_ip = [conn.remote_addr.ip[0], conn.remote_addr.ip[1], conn.remote_addr.ip[2], conn.remote_addr.ip[3]];
+                let c_port = u16::from_be(conn.remote_addr.port);
+                let l_ip = [conn.local_addr.ip[0], conn.local_addr.ip[1], conn.local_addr.ip[2], conn.local_addr.ip[3]];
+                let l_port = u16::from_be(conn.local_addr.port);
+                let r_ip = c_ip;
+                let r_port = c_port;
+
+                unsafe {
+                    if !client_ip.is_null() {
+                        for i in 0..4u64 {
+                            core::ptr::write_volatile(client_ip.add(i as usize), c_ip[i as usize]);
                         }
-                        let mut found = -1i32;
-                        for (fd, slot) in socks.iter_mut().enumerate() {
-                            if slot.is_none() {
-                                let mut new_sock = Socket::new(SocketType::Stream);
-                                new_sock.state = SocketState::Connected;
-                                new_sock.local_addr = Some(SocketAddrIn::new(
-                                    [conn.local_addr.ip[0], conn.local_addr.ip[1], conn.local_addr.ip[2], conn.local_addr.ip[3]],
-                                    u16::from_be(conn.local_addr.port),
-                                ));
-                                new_sock.remote_addr = Some(SocketAddrIn::new(
-                                    [conn.remote_addr.ip[0], conn.remote_addr.ip[1], conn.remote_addr.ip[2], conn.remote_addr.ip[3]],
-                                    u16::from_be(conn.remote_addr.port),
-                                ));
-                                *slot = Some(new_sock);
-                                found = fd as i32;
-                                break;
-                            }
-                        }
-                        return found;
+                    }
+                    if !client_port.is_null() {
+                        core::ptr::write_volatile(client_port, c_port);
                     }
                 }
+
+                // Remove connection from the table
+                *conn_opt = None;
+                drop(conns);
+
+                // Create a new connected socket
+                let mut socks2 = sockets();
+                for slot in socks2.iter_mut() {
+                    if slot.is_none() {
+                        let mut new_sock = Socket::new(SocketType::Stream);
+                        new_sock.state = SocketState::Connected;
+                        new_sock.local_addr = Some(SocketAddrIn::new(l_ip, l_port));
+                        new_sock.remote_addr = Some(SocketAddrIn::new(r_ip, r_port));
+                        *slot = Some(new_sock);
+                        return (socks2.iter().position(|s| s.is_some()).unwrap_or(0)) as i32;
+                    }
+                }
+                // Find the fd for the slot we just wrote
+                let mut found = -1i32;
+                for (fd, slot) in socks2.iter_mut().enumerate() {
+                    if slot.as_ref().map_or(false, |s| s.state == SocketState::Connected && s.remote_addr.map_or(false, |r| r.sin_port == r_port.to_be())) {
+                        found = fd as i32;
+                        break;
+                    }
+                }
+                return found;
             }
         }
     }
@@ -738,6 +760,29 @@ fn process_tcp_packet(
                 if sock.state == SocketState::Listen && sock.socket_type == SocketType::Stream {
                     if let Some(ref local) = sock.local_addr {
                         if local.port_be() == dst_port {
+                            // Enforce backlog: count existing connections for this port
+                            let backlog = sock.backlog;
+                            if backlog > 0 {
+                                let mut count = 0i32;
+                                let conns_ref = tcp_connections();
+                                for conn_opt in conns_ref.iter() {
+                                    if let Some(ref conn) = conn_opt {
+                                        if u16::from_be(conn.local_addr.port) == dst_port
+                                            && (conn.state == tcp::TcpState::SynReceived
+                                                || conn.state == tcp::TcpState::Established)
+                                        {
+                                            count += 1;
+                                        }
+                                    }
+                                }
+                                drop(conns_ref);
+                                if count >= backlog {
+                                    // Backlog full: silently drop SYN
+                                    return;
+                                }
+                            }
+                            drop(socks);
+
                             let my_ip = NET_CONFIG.lock().ip;
                             let local_addr = SocketAddr::new(my_ip, dst_port);
                             let remote_addr = SocketAddr::new(src_ip, src_port);
@@ -745,23 +790,12 @@ fn process_tcp_packet(
                             conn.recv_seq = seq_num.wrapping_add(1);
                             conn.state = tcp::TcpState::SynReceived;
                             conn.update_activity();
-                            let _syn_ack_seq = conn.send_seq;
                             conn.send_seq = conn.send_seq.wrapping_add(1);
                             if let Some((_ack, response)) = conn.process_segment(
                                 tcp::FLAG_SYN | tcp::FLAG_ACK,
                                 seq_num, 0, tcp::DEFAULT_WINDOW, &[],
                             ) {
-                                drop(socks);
                                 let _ = stack.send_ipv4(src_ip, ipv4::PROTOCOL_TCP, &response[..]);
-                                // Re-lock to insert connection
-                                let mut conns = tcp_connections();
-                                for slot in conns.iter_mut() {
-                                    if slot.is_none() {
-                                        *slot = Some(conn);
-                                        break;
-                                    }
-                                }
-                                return;
                             }
                             let mut conns = tcp_connections();
                             for slot in conns.iter_mut() {

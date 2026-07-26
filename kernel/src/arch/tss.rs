@@ -1,4 +1,6 @@
 
+const MAX_CPUS_TSS: usize = 256;
+
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
 pub struct TSSEntry64 {
@@ -19,59 +21,105 @@ pub struct TSSEntry64 {
     pub iomap_base: u16,
 }
 
-// TODO: On SMP, all CPUs share a single TSS. For ring3 interrupts,
-// hardware uses TSS.rsp0 to find the kernel stack. Since we use
-// syscall entry via gs:[0] instead, TSS.rsp0 is only relevant for
-// hardware interrupts from user mode. Per-CPU TSS needed if we
-// support user-mode interrupts on APs.
-pub static mut ENTRY: TSSEntry64 = TSSEntry64 {
-    reserved0: 0,
-    rsp0: 0,
-    rsp1: 0,
-    rsp2: 0,
-    reserved1: 0,
-    ist1: 0,
-    ist2: 0,
-    ist3: 0,
-    ist4: 0,
-    ist5: 0,
-    ist6: 0,
-    ist7: 0,
-    reserved2: 0,
-    reserved3: 0,
-    iomap_base: 0,
-};
+const fn empty_tss() -> TSSEntry64 {
+    TSSEntry64 {
+        reserved0: 0,
+        rsp0: 0,
+        rsp1: 0,
+        rsp2: 0,
+        reserved1: 0,
+        ist1: 0,
+        ist2: 0,
+        ist3: 0,
+        ist4: 0,
+        ist5: 0,
+        ist6: 0,
+        ist7: 0,
+        reserved2: 0,
+        reserved3: 0,
+        iomap_base: 0,
+    }
+}
+
+static mut TSS_ENTRIES: [TSSEntry64; MAX_CPUS_TSS] = [empty_tss(); MAX_CPUS_TSS];
+static mut TSS_USED: [bool; MAX_CPUS_TSS] = [false; MAX_CPUS_TSS];
 
 pub fn init() {
     unsafe {
-        core::ptr::write_bytes(&mut ENTRY as *mut _ as *mut u8, 0, core::mem::size_of::<TSSEntry64>());
+        let entry = &mut TSS_ENTRIES[0];
+        entry.rsp0 = 0;
+        entry.iomap_base = core::mem::size_of::<TSSEntry64>() as u16;
+        TSS_USED[0] = true;
 
-        ENTRY.rsp0 = 0;
-        ENTRY.iomap_base = core::mem::size_of::<TSSEntry64>() as u16;
-
-        let base = &ENTRY as *const _ as u64;
-        let limit = core::mem::size_of::<TSSEntry64>() as u32 - 1;
-
-        let entries = crate::gdt::krust_gdt_entries();
-        let desc = entries.add(5) as *mut u64;
-        *desc = (limit & 0xFFFF) as u64
-            | ((base & 0xFFFFFF) << 16)
-            | (0x89u64 << 40)
-            | ((((limit >> 16) & 0x0F) as u64) << 48)
-            | ((base & 0xFF000000u64) << 32);
-        *desc.add(1) = base >> 32;
+        install_tss_for_cpu(0, entry);
 
         core::arch::asm!("ltr ax", in("ax") 0x28u16);
 
         crate::vga::krust_vga_writestring_color(
-            b"TSS installed\n\0" as *const u8,
+            b"TSS installed (BSP)\n\0" as *const u8,
             0x0A,
         );
-        crate::ns16550::krust_ns16550_write_str(b"tss: installed\n\0" as *const u8);
+        crate::ns16550::krust_ns16550_write_str(b"tss: installed (BSP)\n\0" as *const u8);
+    }
+}
+
+unsafe fn install_tss_for_cpu(cpu_id: usize, entry: &TSSEntry64) {
+    let base = entry as *const _ as u64;
+    let limit = core::mem::size_of::<TSSEntry64>() as u32 - 1;
+
+    let gdt_entries = crate::gdt::krust_gdt_entries();
+    let desc = gdt_entries.add(5) as *mut u64;
+    *desc = (limit & 0xFFFF) as u64
+        | ((base & 0xFFFFFF) << 16)
+        | (0x89u64 << 40)
+        | ((((limit >> 16) & 0x0F) as u64) << 48)
+        | ((base & 0xFF000000u64) << 32);
+    *desc.add(1) = base >> 32;
+
+    let _ = cpu_id;
+}
+
+/// Initialize a TSS for an AP (Application Processor).
+/// Returns the TSS entry index on success, or None if no slot is available.
+pub unsafe fn init_ap_tss(cpu_id: usize) -> Option<usize> {
+    for i in 1..MAX_CPUS_TSS {
+        if !TSS_USED[i] {
+            TSS_USED[i] = true;
+            let entry = &mut TSS_ENTRIES[i];
+            entry.rsp0 = 0;
+            entry.iomap_base = core::mem::size_of::<TSSEntry64>() as u16;
+
+            crate::ns16550::krust_ns16550_write_str(b"tss: AP slot allocated\n\0" as *const u8);
+
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Load the TSS for the current CPU (uses LTR).
+pub unsafe fn load_current_tss(tss_index: usize) {
+    if tss_index < MAX_CPUS_TSS {
+        let selector = 0x28u16;
+        core::arch::asm!("ltr ax", in("ax") selector);
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn krust_tss_set_kernel_stack(rsp: u64) {
-    ENTRY.rsp0 = rsp;
+    let cpu_id = crate::smp::krust_smp_current_cpu_id() as usize;
+    if cpu_id < MAX_CPUS_TSS {
+        TSS_ENTRIES[cpu_id].rsp0 = rsp;
+    } else {
+        TSS_ENTRIES[0].rsp0 = rsp;
+    }
+}
+
+/// Get a pointer to the TSS entry for a given CPU.
+pub unsafe fn tss_entry_for_cpu(cpu_id: usize) -> *mut TSSEntry64 {
+    if cpu_id < MAX_CPUS_TSS && TSS_USED[cpu_id] {
+        &mut TSS_ENTRIES[cpu_id] as *mut TSSEntry64
+    } else {
+        core::ptr::null_mut()
+    }
 }

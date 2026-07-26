@@ -98,6 +98,16 @@ fn virtio_write_wrapper(drive: i32, lba: u64, count: u32, buf: *const u8) -> i32
     unsafe { crate::virtio_blk::krust_virtio_blk_write(lba, buf, count) }
 }
 
+fn usb_read_wrapper(drive: i32, lba: u64, count: u32, buf: *mut u8) -> i32 {
+    unsafe { crate::usb_storage::usb_stor_read(drive as usize, lba, count, buf) }
+}
+
+fn usb_write_wrapper(drive: i32, lba: u64, count: u32, buf: *const u8) -> i32 {
+    unsafe { crate::usb_storage::usb_stor_write(drive as usize, lba, count, buf) }
+}
+
+fn usb_flush_wrapper(_drive: i32) -> i32 { 0 }
+
 pub fn register_block_device(
     name: &[u8],
     driver: BlockDriverType,
@@ -273,6 +283,39 @@ pub fn detect_all_devices() {
                 Some(virtio_write_wrapper),
                 None,
             );
+        }
+
+        // USB Mass Storage devices
+        let usb_count = crate::usb_storage::storage_device_count();
+        for d in 0..usb_count {
+            // Probe capacity
+            if !crate::usb_storage::usb_stor_test_unit_ready(d) {
+                continue;
+            }
+            if !crate::usb_storage::usb_stor_read_capacity(d) {
+                continue;
+            }
+            if let Some(usb_dev) = crate::usb_storage::storage_device(d) {
+                let sectors = usb_dev.block_count;
+                let bs = usb_dev.block_size;
+                if sectors == 0 { continue; }
+                // Find next available letter for sdX
+                // ATA uses 0..3, AHCI starts at 8, so USB devices get their own numbering
+                let letter_offset = 16u8 + d as u8;
+                name_buf[..2].copy_from_slice(b"sd");
+                name_buf[2] = letter_offset;
+                name_buf[3] = 0;
+                register_block_device(
+                    &name_buf[..3],
+                    BlockDriverType::USB,
+                    d as i32,
+                    bs,
+                    sectors,
+                    Some(usb_read_wrapper),
+                    Some(usb_write_wrapper),
+                    Some(usb_flush_wrapper),
+                );
+            }
         }
     }
 }

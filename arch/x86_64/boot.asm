@@ -11,6 +11,13 @@ multiboot2_start:
     dd MBOOT2_ARCH
     dd MBOOT2_HEADER_LEN
     dd MBOOT2_CHECKSUM
+    ; Tag: framebuffer request (type 5, flags=0, size=20)
+    dd 5            ; type = framebuffer
+    dd 0            ; flags = 0 (required)
+    dd 20           ; size = 20
+    dd 0            ; width = 0 (any)
+    dd 0            ; height = 0 (any)
+    dd 32           ; bpp = 32
     ; Tag: end (required)
     dw 0     ; type
     dw 0     ; flags

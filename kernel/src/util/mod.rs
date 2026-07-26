@@ -1,3 +1,4 @@
+pub mod config;
 pub mod cpuid;
 pub mod elf;
 pub mod klib;

@@ -348,12 +348,82 @@ unsafe fn cmd_ls(args: *mut u8) {
         return;
     }
     if (*node).type_ == 1 {
-        t_write(b"Contents of \0" as *const u8);
+        // Print header
+        t_putchar(b' ');
+        crate::terminal::krust_terminal_set_color(0x0E);
         t_write(path as *const u8);
-        t_write(b":\n\0" as *const u8);
-        list_dir(node, 0);
+        crate::terminal::krust_terminal_set_color(0x07);
+        t_write(b"/\n\0" as *const u8);
+
+        let mut child = (*node).children;
+        let mut file_count: u32 = 0;
+        let mut dir_count: u32 = 0;
+
+        while !child.is_null() {
+            // Type indicator with color
+            if (*child).type_ == 1 {
+                crate::terminal::krust_terminal_set_color(0x0B); // cyan for dirs
+                t_putchar(b'[');
+                t_write(b"dir \0" as *const u8);
+                t_putchar(b']');
+                t_putchar(b' ');
+                crate::terminal::krust_terminal_set_color(0x0B);
+                t_write((*child).name.as_ptr());
+                t_putchar(b'/');
+                crate::terminal::krust_terminal_set_color(0x07);
+                dir_count += 1;
+            } else {
+                crate::terminal::krust_terminal_set_color(0x08); // dark gray prefix
+                t_putchar(b'[');
+                t_write(b"file\0" as *const u8);
+                t_putchar(b']');
+                t_putchar(b' ');
+                // Color based on file size
+                if (*child).size > 1024 {
+                    crate::terminal::krust_terminal_set_color(0x0F); // bright white for large files
+                } else {
+                    crate::terminal::krust_terminal_set_color(0x07); // gray for small files
+                }
+                t_write((*child).name.as_ptr());
+                // Show size
+                crate::terminal::krust_terminal_set_color(0x08);
+                t_write(b"  (\0" as *const u8);
+                t_uint((*child).size);
+                t_write(b" B)\0" as *const u8);
+                crate::terminal::krust_terminal_set_color(0x07);
+                file_count += 1;
+            }
+            t_putchar(b'\n');
+            child = (*child).next;
+        }
+
+        // Summary line
+        crate::terminal::krust_terminal_set_color(0x08);
+        t_putchar(b' ');
+        t_putchar(b' ');
+        t_uint(dir_count);
+        t_write(b" directories, \0" as *const u8);
+        t_uint(file_count);
+        t_write(b" files\n\0" as *const u8);
+        crate::terminal::krust_terminal_set_color(0x07);
     } else {
-        print_node(node, 0);
+        // Single file - show detailed info
+        crate::terminal::krust_terminal_set_color(0x0F);
+        t_write((*node).name.as_ptr());
+        crate::terminal::krust_terminal_set_color(0x07);
+        t_putchar(b' ');
+        t_putchar(b' ');
+        if (*node).size > 0 {
+            crate::terminal::krust_terminal_set_color(0x08);
+            t_write(b"(\0" as *const u8);
+            t_uint((*node).size);
+            t_write(b" bytes)\0" as *const u8);
+        } else {
+            crate::terminal::krust_terminal_set_color(0x08);
+            t_write(b"(empty)\0" as *const u8);
+        }
+        crate::terminal::krust_terminal_set_color(0x07);
+        t_putchar(b'\n');
     }
 }
 
@@ -675,6 +745,55 @@ unsafe fn cmd_umount(args: *mut u8) {
     }
 }
 
+unsafe fn cmd_neofetch() {
+    crate::cli_art::cli_art_print_neofetch();
+}
+
+unsafe fn cmd_tree(args: *mut u8) {
+    let path = if !args.is_null() && ptr::read_volatile(args) != 0 {
+        args
+    } else {
+        b"/\0" as *const u8 as *mut u8
+    };
+    let node = krust_vfs_resolve(path as *const u8);
+    if node.is_null() {
+        t_write(b"tree: '\0" as *const u8);
+        t_write(path as *const u8);
+        t_write(b"' not found\n\0" as *const u8);
+        return;
+    }
+    crate::cli_art::cli_art_print_tree(node, b"\0", true);
+}
+
+unsafe fn cmd_top() {
+    crate::cli_art::cli_art_print_top();
+}
+
+unsafe fn cmd_cowsay(args: *const *const u8, argc: i32) {
+    if argc < 2 {
+        crate::cli_art::cli_art_print_cowsay(b"Moo!\0".as_ptr());
+        return;
+    }
+    // Join args into a single string
+    let mut buf = [0u8; 256];
+    let mut pos = 0;
+    for i in 1..argc {
+        let s = *args.add(i as usize);
+        if s.is_null() { continue; }
+        let sl = krust_strlen(s);
+        if pos + sl < buf.len() {
+            krust_memcpy(buf.as_mut_ptr().add(pos), s, sl);
+            pos += sl;
+        }
+        if i + 1 < argc && pos < buf.len() {
+            buf[pos] = b' ';
+            pos += 1;
+        }
+    }
+    buf[pos] = 0;
+    crate::cli_art::cli_art_print_cowsay(buf.as_ptr());
+}
+
 unsafe fn parse_args(cmd: *mut u8, args: *mut *mut u8, argc: *mut i32) {
     let mut ac = 0i32;
     let mut p = cmd;
@@ -713,6 +832,7 @@ unsafe fn is_write_cmd(name: *const u8) -> bool {
 
 #[no_mangle]
 pub unsafe fn shell_run() {
+    crate::cli_art::cli_art_login();
     crate::cli_art::cli_art_print_splash();
 
     let mut cmd_line: [u8; MAX_CMD_LEN] = [0; MAX_CMD_LEN];
@@ -925,6 +1045,14 @@ pub unsafe fn shell_run() {
             cmd_df(ptr::null_mut());
         } else if krust_strcmp(cmd_name, b"date\0" as *const u8) == 0 {
             cmd_date(ptr::null_mut());
+        } else if krust_strcmp(cmd_name, b"neo\0" as *const u8) == 0 || krust_strcmp(cmd_name, b"neofetch\0" as *const u8) == 0 {
+            cmd_neofetch();
+        } else if krust_strcmp(cmd_name, b"tree\0" as *const u8) == 0 {
+            cmd_tree(if argc > 1 { *args.as_mut_ptr().add(1) } else { ptr::null_mut() });
+        } else if krust_strcmp(cmd_name, b"top\0" as *const u8) == 0 {
+            cmd_top();
+        } else if krust_strcmp(cmd_name, b"cowsay\0" as *const u8) == 0 || krust_strcmp(cmd_name, b"moo\0" as *const u8) == 0 {
+            cmd_cowsay(args.as_mut_ptr() as *const *const u8, argc);
         } else {
             t_write(b"Unknown command: \0" as *const u8);
             t_write(cmd_name as *const u8);

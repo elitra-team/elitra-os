@@ -58,8 +58,131 @@ struct MultibootFB {
     fb_type: u8,
 }
 
+unsafe fn init_framebuffer(magic: u32, addr: u32) {
+    if magic == 0x2BADB002 {
+        // Multiboot1: info struct is at addr directly
+        let mbi = &*(addr as *const MultibootFB);
+        if mbi.flags & (1 << 12) != 0 {
+            // bit 12 = framebuffer info available
+            crate::framebuffer::krust_framebuffer_init(
+                mbi.fb_addr, mbi.fb_width, mbi.fb_height, mbi.fb_pitch, mbi.fb_bpp,
+            );
+            crate::framebuffer::krust_framebuffer_clear(crate::framebuffer::COLOR_BLACK);
+            crate::fb_console::fb_console_init(mbi.fb_width, mbi.fb_height, mbi.fb_pitch, mbi.fb_bpp, mbi.fb_addr as *mut u8);
+            SAVED_FB_W = mbi.fb_width;
+            SAVED_FB_H = mbi.fb_height;
+            FB_AVAILABLE = true;
+            serial(b"step: fb ok (multiboot1)\n\0");
+            return;
+        }
+    } else if magic == 0x36d76289 {
+        // Multiboot2: parse tags to find framebuffer (type 5)
+        let info = addr as *const u8;
+        let total_size = ptr::read_volatile(info as *const u32);
+        let mut offset = 8u32; // skip total_size + reserved
+        while offset < total_size {
+            let tag_type = ptr::read_volatile(info.add(offset as usize) as *const u32);
+            let tag_size = ptr::read_volatile(info.add(offset as usize + 4) as *const u32);
+            if tag_type == 0 || tag_size < 8 { break; } // end tag
+            if tag_type == 5 && tag_size >= 20 {
+                // Framebuffer tag
+                let fb_addr = ptr::read_volatile(info.add(offset as usize + 8) as *const u64);
+                let fb_pitch = ptr::read_volatile(info.add(offset as usize + 16) as *const u32);
+                let fb_width = ptr::read_volatile(info.add(offset as usize + 20) as *const u32);
+                let fb_height = ptr::read_volatile(info.add(offset as usize + 24) as *const u32);
+                let fb_bpp = ptr::read_volatile(info.add(offset as usize + 28));
+                crate::framebuffer::krust_framebuffer_init(fb_addr, fb_width, fb_height, fb_pitch, fb_bpp);
+                crate::framebuffer::krust_framebuffer_clear(crate::framebuffer::COLOR_BLACK);
+                crate::fb_console::fb_console_init(fb_width, fb_height, fb_pitch, fb_bpp, fb_addr as *mut u8);
+                SAVED_FB_W = fb_width;
+                SAVED_FB_H = fb_height;
+                FB_AVAILABLE = true;
+                serial(b"step: fb ok (multiboot2)\n\0");
+                return;
+            }
+            // align to 8 bytes
+            offset += (tag_size + 7) & !7;
+        }
+    } else if magic == 0x00000000 && addr != 0 {
+        // PVH boot: addr points to hvm_start_info, check its magic at offset 0
+        let hvm = addr as *const u8;
+        let hvm_magic = ptr::read_volatile(hvm as *const u32);
+        if hvm_magic == 0x36d76289 {
+            // hvm_start_info framebuffer is at offset 124
+            let fb_addr = ptr::read_volatile(hvm.add(124) as *const u64);
+            let fb_size = ptr::read_volatile(hvm.add(132) as *const u32);
+            // fb_size encodes width:16 | height:16 (if non-zero)
+            let fb_w = fb_size & 0xFFFF;
+            let fb_h = (fb_size >> 16) & 0xFFFF;
+            if fb_addr != 0 && fb_w != 0 && fb_h != 0 {
+                // QEMU standard VGA framebuffer is 640x480x32 with pitch = width*4
+                let fb_pitch = fb_w * 4;
+                let fb_bpp = 32u8;
+                crate::framebuffer::krust_framebuffer_init(fb_addr, fb_w, fb_h, fb_pitch, fb_bpp);
+                crate::framebuffer::krust_framebuffer_clear(crate::framebuffer::COLOR_BLACK);
+                crate::fb_console::fb_console_init(fb_w, fb_h, fb_pitch, fb_bpp, fb_addr as *mut u8);
+                SAVED_FB_W = fb_w;
+                SAVED_FB_H = fb_h;
+                FB_AVAILABLE = true;
+                serial(b"step: fb ok (pvh)\n\0");
+                return;
+            }
+            // Even if framebuffer tag not in hvm_start_info, VGA text buffer is at 0xB8000
+            // Try standard VGA text mode framebuffer info
+            serial(b"pvh: no framebuffer in hvm_start_info, trying VGA fallback\n\0");
+        }
+    }
+    serial(b"step: fb not available\n\0");
+}
+
+static mut SAVED_FB_W: u32 = 0;
+static mut SAVED_FB_H: u32 = 0;
+static mut FB_AVAILABLE: bool = false;
+
 unsafe fn serial(s: &[u8]) {
     crate::ns16550::krust_ns16550_write_str(s.as_ptr());
+}
+
+extern "C" fn block_dev_read(
+    _node: *mut VNode, buf: *mut u8, size: u32, offset: u32,
+) -> i32 {
+    unsafe {
+        let dev_index = (*_node).data as usize;
+        if let Some(dev) = crate::block::get_device(dev_index) {
+            let sector_size = dev.sector_size;
+            if sector_size == 0 { return 0; }
+            let start_sector = (offset as u64) / (sector_size as u64);
+            let read_count = core::cmp::min((size + sector_size - 1) / sector_size, 256u32);
+            if crate::block::block_read(dev_index, start_sector, read_count, buf) == 0 {
+                size as i32
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    }
+}
+
+extern "C" fn block_dev_write(
+    _node: *mut VNode, buf: *const u8, size: u32, offset: u32,
+) -> i32 {
+    unsafe {
+        let dev_index = (*_node).data as usize;
+        if let Some(dev) = crate::block::get_device(dev_index) {
+            let sector_size = dev.sector_size;
+            if sector_size == 0 { return 0; }
+            let start_sector = (offset as u64) / (sector_size as u64);
+            let write_count = core::cmp::min((size + sector_size - 1) / sector_size, 256u32);
+            if crate::block::block_write(dev_index, start_sector, write_count, buf) == 0 {
+                size as i32
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    }
 }
 
 unsafe fn fb_console(s: &[u8]) {
@@ -171,6 +294,63 @@ extern "C" fn mouse_dev_write(
     size as i32
 }
 
+extern "C" fn tty_dev_read(
+    _node: *mut VNode, buf: *mut u8, size: u32, _offset: u32,
+) -> i32 {
+    unsafe {
+        // /dev/tty reads from the current process's stdin
+        let current = crate::scheduler::krust_sched_current();
+        if !current.is_null() && (*current).stdin_fd >= 0 {
+            crate::vfs::krust_vfs_pipe_read((*current).stdin_fd, buf, size)
+        } else {
+            // Fall back to PS/2 keyboard
+            let mut total = 0u32;
+            while total < size {
+                let c = crate::ps2keyboard::krust_ps2kbd_getchar();
+                if c == 0 {
+                    break;
+                }
+                ptr::write_volatile(buf.add(total as usize), c);
+                total += 1;
+                if c == b'\n' {
+                    break;
+                }
+            }
+            total as i32
+        }
+    }
+}
+
+extern "C" fn tty_dev_write(
+    _node: *mut VNode, buf: *const u8, size: u32, _offset: u32,
+) -> i32 {
+    unsafe {
+        // /dev/tty writes to stdout (VGA + serial)
+        crate::vga::krust_vga_write(buf, size as usize);
+        crate::ns16550::krust_ns16550_write_buf(buf, size as usize);
+    }
+    size as i32
+}
+
+extern "C" fn kmsg_dev_read(
+    _node: *mut VNode, buf: *mut u8, size: u32, _offset: u32,
+) -> i32 {
+    unsafe {
+        // kmsg returns nothing for now (no ring buffer implemented)
+        0
+    }
+}
+
+extern "C" fn kmsg_dev_write(
+    _node: *mut VNode, buf: *const u8, size: u32, _offset: u32,
+) -> i32 {
+    unsafe {
+        crate::ns16550::krust_ns16550_write_buf(buf, size as usize);
+        crate::vga::krust_vga_write(buf, size as usize);
+    }
+    size as i32
+}
+
 unsafe fn init_initrd() {
     krust_vfs_create_dir(b"/bin\0" as *const u8);
     krust_vfs_create_dir(b"/home\0" as *const u8);
@@ -191,10 +371,26 @@ unsafe fn init_initrd() {
         Some(dev_random_read),
         Some(dev_random_write),
     );
+    // urandom is identical to random (no distinction in this OS)
+    krust_vfs_create_device(
+        b"/dev/urandom\0" as *const u8,
+        Some(dev_random_read),
+        Some(dev_random_write),
+    );
     krust_vfs_create_device(
         b"/dev/mouse\0" as *const u8,
         Some(mouse_dev_read),
         Some(mouse_dev_write),
+    );
+    krust_vfs_create_device(
+        b"/dev/tty\0" as *const u8,
+        Some(tty_dev_read),
+        Some(tty_dev_write),
+    );
+    krust_vfs_create_device(
+        b"/dev/kmsg\0" as *const u8,
+        Some(kmsg_dev_read),
+        Some(kmsg_dev_write),
     );
     krust_vfs_create_dir(b"/dev/input\0" as *const u8);
     krust_vfs_create_dir(b"/tmp\0" as *const u8);
@@ -306,33 +502,7 @@ pub unsafe extern "C" fn kernel_main(magic: u32, addr: u32) {
         serial(b"smep/smap not supported\n\0");
     }
 
-    if magic == 0x2BADB002 {
-        let mbi = &*(addr as *const MultibootFB);
-        if mbi.flags & (1 << 6) != 0 {
-            crate::framebuffer::krust_framebuffer_init(
-                mbi.fb_addr,
-                mbi.fb_width,
-                mbi.fb_height,
-                mbi.fb_pitch,
-                mbi.fb_bpp,
-            );
-            crate::framebuffer::krust_framebuffer_clear(crate::framebuffer::COLOR_BLACK);
-             serial(b"step: fb ok\n\0");
-             
-             // Initialize fb_console
-             let fb_width = mbi.fb_width;
-             let fb_height = mbi.fb_height;
-             let fb_pitch = mbi.fb_pitch;
-             let fb_bpp = mbi.fb_bpp;
-             let fb_ptr = mbi.fb_addr as *mut u8;
-             
-             unsafe {
-                 crate::fb_console::fb_console_init(fb_width, fb_height, fb_pitch, fb_bpp, fb_ptr);
-             }
-             
-             serial(b"step: fb console ok\n\0");
-         }
-     }
+    init_framebuffer(magic, addr);
 
      // Initialize mouse cursor
      unsafe {
@@ -349,6 +519,13 @@ pub unsafe extern "C" fn kernel_main(magic: u32, addr: u32) {
      fb_console(b"Initializing PCI... \0");
     crate::pci::PCI::config_read_word(0, 0, 0, 0);
     serial(b"step: pci ok\n\0");
+
+    fb_console(b"Initializing VGA... \0");
+    if crate::vga::krust_vga_vbe_init() {
+        serial(b"step: vbe ok (1024x768x32)\n\0");
+    } else {
+        serial(b"step: vbe not available, using VGA text\n\0");
+    }
 
     fb_console(b"Initializing ATA... \0");
     krust_ata_init();
@@ -608,6 +785,72 @@ pub unsafe extern "C" fn kernel_main(magic: u32, addr: u32) {
         serial(b"step: e1000 not found\n\0");
     }
 
+    // USB controller auto-detection via PCI
+    fb_console(b"Scanning for USB controllers... \0");
+    serial(b"usb: scanning PCI for USB controllers\n\0");
+    {
+        // Scan all PCI slots for USB controllers (class 0x0C, subclass 0x03)
+        for bus in 0..=255u16 {
+            for slot in 0..32u8 {
+                for func in 0..8u8 {
+                    let vid = crate::pci::PCI::config_read_word(bus as u8, slot, func, 0x00);
+                    if vid == 0xFFFF { continue; }
+                    let class_reg = crate::pci::PCI::config_read_dword(bus as u8, slot, func, 0x08);
+                    let cc = ((class_reg >> 24) & 0xFF) as u8;
+                    let sc = ((class_reg >> 16) & 0xFF) as u8;
+                    let prog_if = ((class_reg >> 8) & 0xFF) as u8;
+                    if cc == 0x0C && sc == 0x03 {
+                        // Enable bus mastering + memory/IO space
+                        let mut cmd = crate::pci::PCI::config_read_word(bus as u8, slot, func, 0x04);
+                        cmd |= (1 << 1) | (1 << 2); // Memory Space + Bus Master
+                        crate::pci::PCI::config_write_word(bus as u8, slot, func, 0x04, cmd);
+
+                        match prog_if {
+                            0x00 => {
+                                // UHCI - I/O space, BAR4 has I/O port base
+                                let bar4 = crate::pci::PCI::read_bar(bus as u8, slot, func, 4);
+                                let io_base = (bar4 & 0xFFFC) as u16;
+                                serial(b"uhci: found at IO=\0");
+                                serial_num(io_base as u32);
+                                serial(b"\n\0");
+                                let rc = crate::usb::krust_usb_init_uhci(io_base);
+                                if rc == 0 {
+                                    fb_console_color(b"UHCI initialized\n\0", 0x0A);
+                                    serial(b"uhci: init ok\n\0");
+                                    // Enumerate USB storage on UHCI
+                                    crate::usb::krust_usb_enumerate_storage();
+                                }
+                            }
+                            0x20 => {
+                                // EHCI - memory space, BAR0 has MMIO base
+                                let bar0 = crate::pci::PCI::read_bar(bus as u8, slot, func, 0);
+                                let mmio_phys = (bar0 & 0xFFFFFFF0) as u64;
+                                serial(b"ehci: found at MMIO=\0");
+                                serial_num(mmio_phys as u32);
+                                serial(b"\n\0");
+                                // Enable memory space access
+                                cmd |= 1 << 1;
+                                crate::pci::PCI::config_write_word(bus as u8, slot, func, 0x04, cmd);
+                                let rc = crate::ehci::krust_ehci_init(mmio_phys);
+                                if rc == 0 {
+                                    fb_console_color(b"EHCI initialized\n\0", 0x0A);
+                                    serial(b"ehci: init ok\n\0");
+                                    // Enumerate USB storage on EHCI
+                                    crate::ehci::krust_ehci_enumerate_storage();
+                                }
+                            }
+                            _ => {
+                                serial(b"usb: unsupported controller prog_if=\0");
+                                serial_num(prog_if as u32);
+                                serial(b"\n\0");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fb_console(b"Detecting block devices... \0");
     crate::block::detect_all_devices();
     let bcount = crate::block::device_count();
@@ -621,7 +864,15 @@ pub unsafe extern "C" fn kernel_main(magic: u32, addr: u32) {
             devpath[4] = b'/';
             let nlen = dev.name.iter().position(|&c| c == 0).unwrap_or(dev.name.len());
             devpath[5..5 + nlen].copy_from_slice(&dev.name[..nlen]);
-            crate::vfs::krust_vfs_create_file(devpath.as_ptr(), core::ptr::null(), 0);
+
+            // Create device node with read/write handlers backed by block layer
+            let dev_idx = i as u32;
+            crate::vfs::krust_vfs_create_device(
+                devpath.as_ptr(),
+                Some(block_dev_read),
+                Some(block_dev_write),
+            );
+
             serial(b"  /dev/\0");
             serial(&dev.name[..nlen]);
             serial(b" [");
@@ -655,13 +906,10 @@ pub unsafe extern "C" fn kernel_main(magic: u32, addr: u32) {
     serial(b"step: smp ok\n\0");
 
     fb_console(b"Initializing compositor... \0");
-    if magic == 0x2BADB002 {
-        let mbi2 = &*(addr as *const MultibootFB);
-        if mbi2.flags & (1 << 6) != 0 {
-            unsafe { crate::gui::compositor_init(mbi2.fb_width, mbi2.fb_height); }
-            crate::mouse_cursor::GUI_ACTIVE = true;
-            serial(b"step: gui ok\n\0");
-        }
+    if FB_AVAILABLE {
+        unsafe { crate::gui::compositor_init(SAVED_FB_W, SAVED_FB_H); }
+        crate::mouse_cursor::GUI_ACTIVE = true;
+        serial(b"step: gui ok\n\0");
     }
 
     fb_console(b"Initializing scheduler... \0");

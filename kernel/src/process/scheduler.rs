@@ -1,6 +1,8 @@
 use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering};
 use crate::heap::{krust_free, krust_malloc};
+use crate::util::config;
+use config::{PAGE_SIZE, USTACK_VADDR, USTACK_PAGES, BRK_INITIAL};
 
 // ─── Types mirrored from C++ ───────────────────────────────────
 
@@ -33,7 +35,7 @@ pub struct TaskContext {
     pub cr3: u64,
 }
 
-const NSIG: usize = 32;
+const NSIG: usize = config::NSIG;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -67,7 +69,7 @@ pub struct VNode {
     pub mode: u16,
 }
 
-pub const MAX_FDS: usize = 64;
+pub const MAX_FDS: usize = config::MAX_FDS;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -94,6 +96,8 @@ pub struct Registers {
 pub struct Task {
     pub id: u32,
     pub ppid: u32,
+    pub pgid: u32,
+    pub sid: u32,
     pub state: TaskState,
     pub ctx: TaskContext,
     pub kstack: *mut u64,
@@ -122,18 +126,15 @@ pub struct Task {
     pub uid: u16,
     pub gid: u16,
     pub oom_score_adj: i16,
+    pub env_count: u32,
+    pub env_keys: [*mut u8; 32],
+    pub env_vals: [*mut u8; 32],
 }
 
 // ─── Constants ─────────────────────────────────────────────────
 
-const MAX_TASKS: u32 = 64;
-const USTACK_VADDR: u64 = 0xC0000000;
-const USTACK_PAGES: u32 = 16;
-const USTACK_SIZE: u32 = USTACK_PAGES * 4096;
-const BRK_INITIAL: u64 = 0x10000000;
-const PAGE_SIZE: u64 = 4096;
+const USTACK_SIZE: u32 = config::USTACK_PAGES * 4096;
 const SIGKILL: i32 = 9;
-const SLEEP_QUEUE_MAX: usize = 64;
 
 // ─── kernel_stack_ptr (per-CPU via gs:[0]) ────────────────────
 
@@ -180,8 +181,8 @@ extern "C" {
 
 // ─── Global state ────────────────────────────────────────────────
 
-static mut TASKS: [Task; 64] = [Task {
-    id: 0, ppid: 0, state: TaskState::READY, ctx: TaskContext { rsp: 0, cr3: 0 },
+static mut TASKS: [Task; 128] = [Task {
+    id: 0, ppid: 0, pgid: 0, sid: 0, state: TaskState::READY, ctx: TaskContext { rsp: 0, cr3: 0 },
     kstack: ptr::null_mut(), ustack: ptr::null_mut(), pages: 0,
     stdin_fd: 0, stdout_fd: 0, stderr_fd: 0, fd_table: ptr::null_mut(), exit_code: 0,
     fpu_state: ptr::null_mut(),
@@ -195,9 +196,13 @@ static mut TASKS: [Task; 64] = [Task {
     vma_list: ptr::null_mut(), program_brk: 0,
     priority: 0, sleep_until: 0,
     uid: 0, gid: 0, oom_score_adj: 0,
-}; 64];
+    env_count: 0,
+    env_keys: [ptr::null_mut(); 32],
+    env_vals: [ptr::null_mut(); 32],
+}; 128];
 
-const MAX_CPUS_SCHED: usize = 64;
+// Per-CPU current task pointers
+const MAX_CPUS_SCHED: usize = config::MAX_CPUS;
 
 // Per-CPU current task pointers
 static mut PER_CPU_CURRENT: [*mut Task; MAX_CPUS_SCHED] = [ptr::null_mut(); MAX_CPUS_SCHED];
@@ -227,13 +232,13 @@ struct SleepQueue {
 unsafe impl Send for SleepQueue {}
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(0);
-static mut FREE_IDS: [u32; 64] = [0u32; 64];
+static mut FREE_IDS: [u32; 128] = [0u32; 128];
 static mut FREE_ID_COUNT: usize = 0;
 static mut SCHED_HAS_FPU: bool = false;
 
 unsafe fn recycle_task_id(id: u32) {
-    if id == 0 || id >= MAX_TASKS { return; }
-    if FREE_ID_COUNT < 64 {
+    if id == 0 || id >= config::MAX_TASKS { return; }
+    if FREE_ID_COUNT < 128 {
         FREE_IDS[FREE_ID_COUNT] = id;
         FREE_ID_COUNT += 1;
     }
@@ -243,12 +248,12 @@ unsafe fn alloc_task_id() -> Option<u32> {
     if FREE_ID_COUNT > 0 {
         FREE_ID_COUNT -= 1;
         let id = FREE_IDS[FREE_ID_COUNT];
-        if id < MAX_TASKS && (*TASKS.as_ptr().add(id as usize)).state == TaskState::EXITED {
+        if id < config::MAX_TASKS && (*TASKS.as_ptr().add(id as usize)).state == TaskState::EXITED {
             return Some(id);
         }
     }
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    if id >= MAX_TASKS {
+    if id >= config::MAX_TASKS {
         NEXT_ID.fetch_sub(1, Ordering::Relaxed);
         return None;
     }
@@ -418,6 +423,8 @@ unsafe fn fpu_restore_current() {
 unsafe fn setup_task_common(t: *mut Task, id: u32, kstack: *mut u64, parent: *mut Task) {
     (*t).id = id;
     (*t).ppid = if parent.is_null() { 0 } else { (*parent).id };
+    (*t).pgid = if parent.is_null() { id } else { (*parent).pgid };
+    (*t).sid = if parent.is_null() { id } else { (*parent).sid };
     (*t).state = TaskState::READY;
     (*t).kstack = kstack;
     (*t).pages = 1;
@@ -739,7 +746,7 @@ pub unsafe extern "C" fn krust_sched_current_cwd() -> *mut u8 {
 
 #[no_mangle]
 pub unsafe extern "C" fn krust_sched_get_task(id: u32) -> *mut Task {
-    if id < MAX_TASKS { &mut TASKS[id as usize] } else { ptr::null_mut() }
+    if id < config::MAX_TASKS { &mut TASKS[id as usize] } else { ptr::null_mut() }
 }
 
 #[no_mangle]
@@ -749,7 +756,7 @@ pub unsafe extern "C" fn krust_sched_get_next_id() -> u32 {
 
 #[no_mangle]
 pub unsafe extern "C" fn krust_sched_max_tasks() -> u32 {
-    MAX_TASKS
+    config::MAX_TASKS
 }
 
 // ─── NodeType constants (mirrored from C++) ───────────────────
@@ -1312,8 +1319,13 @@ pub unsafe extern "C" fn krust_sched_kill(pid: i32, sig: i32) -> i32 {
     if sig < 0 || sig as usize >= NSIG { return -1; }
     if pid < 0 || pid as u32 >= NEXT_ID.load(Ordering::Relaxed) { return -1; }
 
+    let current = get_current();
     let t = &mut TASKS[pid as usize];
     if (*t).state == TaskState::EXITED { return -1; }
+
+    if !current.is_null() && (*current).uid != 0 && (*current).uid != (*t).uid {
+        return -1;
+    }
 
     if sig == SIGKILL {
         (*t).exit_code = 0x100 + SIGKILL as u32;
@@ -1333,6 +1345,12 @@ pub unsafe extern "C" fn krust_sched_kill(pid: i32, sig: i32) -> i32 {
 pub unsafe extern "C" fn krust_sched_sigaction(sig: i32, handler: u64, old_handler: *mut u64) -> i32 {
     if sig < 0 || sig as usize >= NSIG || get_current().is_null() { return -1; }
     if sig == SIGKILL { return -1; }
+
+    if handler != 0 && handler != 1 {
+        if handler > 0x00007FFFFFFFFFFF || handler < 0x1000 {
+            return -1;
+        }
+    }
 
     if !old_handler.is_null() {
         *old_handler = (*get_current()).sig_handlers[sig as usize].handler_addr;
@@ -1355,11 +1373,29 @@ pub unsafe extern "C" fn krust_sched_sigreturn(r: *mut Registers) -> i32 {
     }
     core::arch::asm!("clac");
 
-    (*r).rip = sigframe[1];
-    (*r).cs = sigframe[2];
-    (*r).rflags = sigframe[3];
-    (*r).user_rsp = sigframe[4];
-    (*r).ss = sigframe[5];
+    let new_rip = sigframe[1];
+    let new_cs = sigframe[2];
+    let new_rsp = sigframe[4];
+    let new_ss = sigframe[5];
+
+    if new_rip < 0x1000 || new_rip > 0x00007FFFFFFFFFFF {
+        return -1;
+    }
+    if new_cs != 0x23 && new_cs != 0x1B {
+        return -1;
+    }
+    if new_ss != 0x2B && new_ss != 0x23 {
+        return -1;
+    }
+    if new_rsp < 0x1000 || new_rsp > 0x00007FFFFFFFFFFF {
+        return -1;
+    }
+
+    (*r).rip = new_rip;
+    (*r).cs = new_cs;
+    (*r).rflags = sigframe[3] & 0xFFFFFFFFFFFFFCFF;
+    (*r).user_rsp = new_rsp;
+    (*r).ss = new_ss;
     (*r).rax = sigframe[0];
 
     if sigframe[0] > 0 && (sigframe[0] as usize) < NSIG {
@@ -1537,6 +1573,8 @@ pub unsafe extern "C" fn krust_sched_preempt(r: *mut Registers) {
         crate::smp::smp_set_kernel_stack(kst);
     }
     fpu_restore_current();
+    // Notify other CPUs that new tasks may be available
+    crate::smp::smp_reschedule_all();
     task_resume(&(*next).ctx);
 }
 
@@ -1562,6 +1600,7 @@ pub unsafe extern "C" fn krust_sched_yield_handler(r: *mut Registers) {
                 crate::smp::smp_set_kernel_stack(kst);
             }
             fpu_restore_current();
+            crate::smp::smp_reschedule_all();
             task_resume(&(*next).ctx);
         }
         fpu_restore_current();
@@ -1590,6 +1629,7 @@ pub unsafe extern "C" fn krust_sched_yield_handler(r: *mut Registers) {
         crate::smp::smp_set_kernel_stack(kst);
     }
     fpu_restore_current();
+    crate::smp::smp_reschedule_all();
     task_resume(&(*next).ctx);
 }
 
@@ -1604,17 +1644,17 @@ pub unsafe extern "C" fn yield_handler_c(r: *mut Registers) {
 
 #[no_mangle]
 pub unsafe extern "C" fn krust_sched_get_task_field_stdout_fd(id: u32) -> i32 {
-    if id < MAX_TASKS { TASKS[id as usize].stdout_fd } else { -1 }
+    if id < config::MAX_TASKS { TASKS[id as usize].stdout_fd } else { -1 }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn krust_sched_get_task_field_stdin_fd(id: u32) -> i32 {
-    if id < MAX_TASKS { TASKS[id as usize].stdin_fd } else { -1 }
+    if id < config::MAX_TASKS { TASKS[id as usize].stdin_fd } else { -1 }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn krust_sched_get_task_field_cwd(id: u32) -> *mut u8 {
-    if id < MAX_TASKS { TASKS[id as usize].cwd.as_mut_ptr() } else { ptr::null_mut() }
+    if id < config::MAX_TASKS { TASKS[id as usize].cwd.as_mut_ptr() } else { ptr::null_mut() }
 }
 
 // ─── Thread/Clone syscalls ─────────────────────────────────────────
@@ -1840,6 +1880,19 @@ unsafe fn oom_score(task: *mut Task) -> i64 {
 }
 
 unsafe fn eager_cleanup_task(task: *mut Task) {
+    if !(*task).fd_table.is_null() {
+        for i in 0..MAX_FDS {
+            if (*task).fd_table.add(i).read().used {
+                (*task).fd_table.add(i).write(crate::scheduler::FDEntry {
+                    node: ptr::null_mut(),
+                    offset: 0,
+                    flags: 0,
+                    used: false,
+                    refcount: 0,
+                });
+            }
+        }
+    }
     if !(*task).vma_list.is_null() {
         let mut vma = (*task).vma_list;
         while !vma.is_null() {

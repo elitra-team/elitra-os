@@ -66,7 +66,7 @@ pub unsafe extern "C" fn krust_swap_init(drive: i32, lba_start: u32, total_secto
     if bitmap.is_null() {
         return -1;
     }
-    krust_memset(bitmap, 0xFF, bitmap_size);
+    krust_memset(bitmap, 0x00, bitmap_size);
 
     SWAP_DRIVE.store(drive as usize, Ordering::Relaxed);
     SWAP_LBA_START.store(lba_start as usize, Ordering::Relaxed);
@@ -165,6 +165,27 @@ pub unsafe fn swap_evict_page(vaddr: u64, target_cr3: u64) -> bool {
     let p1 = (*p2.add(i2) & PTE_MASK) as *mut u64;
     let old_pte = *p1.add(i1);
     if (old_pte & 1) == 0 { swap_free_slot(slot as usize); return false; }
+
+    let cow_bit: u64 = 0x200;
+    if (old_pte & cow_bit) != 0 {
+        let saved_cr3 = {
+            let v: u64;
+            core::arch::asm!("mov {}, cr3", out(reg) v);
+            v
+        };
+        if target_cr3 != saved_cr3 {
+            core::arch::asm!("mov cr3, {}", in(reg) target_cr3);
+        }
+        crate::paging::cow_resolve_page(target_cr3, vaddr);
+        if target_cr3 != saved_cr3 {
+            core::arch::asm!("mov cr3, {}", in(reg) saved_cr3);
+        }
+        let refreshed_pte = *p1.add(i1);
+        if (refreshed_pte & cow_bit) != 0 {
+            swap_free_slot(slot as usize);
+            return false;
+        }
+    }
 
     let phys = old_pte & PTE_MASK;
     let buf = krust_malloc(PAGE_SIZE as u32);

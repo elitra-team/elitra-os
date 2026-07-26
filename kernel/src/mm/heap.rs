@@ -15,20 +15,34 @@ struct HeapBlock {
 static mut HEAP_HEAD: *mut HeapBlock = ptr::null_mut();
 static LOCK: AtomicBool = AtomicBool::new(false);
 
-struct SpinLock;
+struct SpinLock {
+    flags: u64,
+}
 
 impl SpinLock {
     fn acquire() -> SpinLock {
+        let flags: u64;
+        unsafe {
+            core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
+        }
         while LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
-        SpinLock
+        SpinLock { flags }
     }
 }
 
 impl Drop for SpinLock {
     fn drop(&mut self) {
         LOCK.store(false, Ordering::Release);
+        unsafe {
+            core::arch::asm!(
+                "push {flags}",
+                "popfq",
+                flags = in(reg) self.flags,
+                options(nostack),
+            );
+        }
     }
 }
 
@@ -105,6 +119,9 @@ pub unsafe extern "C" fn krust_heap_free(ptr: *mut u8) {
     }
     let _guard = SpinLock::acquire();
     let block = (ptr as usize - size_of::<HeapBlock>()) as *mut HeapBlock;
+    if (*block).free {
+        return;
+    }
     (*block).free = true;
     merge_adjacent();
 }
@@ -128,7 +145,8 @@ pub unsafe extern "C" fn krust_heap_realloc(ptr: *mut u8, size: u32) -> *mut u8 
     let new_ptr = krust_heap_alloc(size);
     if !new_ptr.is_null() {
         let old_block = (ptr as usize - size_of::<HeapBlock>()) as *mut HeapBlock;
-        ptr::copy_nonoverlapping(ptr, new_ptr, (*old_block).size);
+        let copy_size = core::cmp::min((*old_block).size, size as usize);
+        ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
         krust_heap_free(ptr);
     }
     new_ptr

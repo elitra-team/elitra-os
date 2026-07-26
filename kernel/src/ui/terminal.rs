@@ -1,7 +1,7 @@
 use core::ptr;
 
-const WIDTH: usize = 80;
-const HEIGHT: usize = 25;
+const WIDTH: usize = 128;
+const HEIGHT: usize = 48;
 const MAX_VTS: usize = 4;
 const SCROLL_LINES: usize = 200;
 const CONTENT_TOP: usize = 1;
@@ -73,6 +73,26 @@ fn make_entry_nonconst(c: u8, color: u8) -> u16 {
 }
 
 fn fb_console_present(_vt: usize, buffer: &[u16], _color: u8) {
+    // If framebuffer is not available, write directly to VGA text buffer at 0xB8000
+    if unsafe { crate::fb_console::fb_console_get_fb_ptr() }.is_null() {
+        const VGA_TEXT: *mut u16 = 0xB8000 as *mut u16;
+        let vga_cols = 80usize;
+        let vga_rows = 25usize;
+        unsafe {
+            for row in 0..vga_rows {
+                let dst = VGA_TEXT.add(row * vga_cols);
+                let src = buffer.as_ptr().add(row * WIDTH);
+                for col in 0..vga_cols {
+                    let idx = row * WIDTH + col;
+                    if idx < buffer.len() {
+                        core::ptr::write_volatile(dst.add(col), core::ptr::read_volatile(src.add(col)));
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     let cols = unsafe { crate::fb_console::fb_console_get_cols() } as usize;
     let rows = unsafe { crate::fb_console::fb_console_get_rows() } as usize;
     
@@ -85,16 +105,13 @@ fn fb_console_present(_vt: usize, buffer: &[u16], _color: u8) {
                 let vga_color = ((entry >> 8) & 0xFF) as u8;
                 let _fb_color = vga4_to_fb_color(vga_color);
                 
-                if c != b' ' {
-                    let x = col as u32;
-                    let y = row as u32;
-                    let fg = vga4_to_fb_color(vga_color & 0x0F);
-                    let bg = vga4_to_fb_color(((vga_color >> 4) & 0x0F) as u8);
-                    
-                    // Draw character
-                    unsafe {
-                        crate::fb_console::fb_console_draw_char_px(x * 8, y * 16, c, fg, bg);
-                    }
+                let x = col as u32;
+                let y = row as u32;
+                let fg = vga4_to_fb_color(vga_color & 0x0F);
+                let bg = vga4_to_fb_color(((vga_color >> 4) & 0x0F) as u8);
+                
+                unsafe {
+                    crate::fb_console::fb_console_draw_char_px(x * 8, y * 16, c, fg, bg);
                 }
             }
         }

@@ -127,6 +127,7 @@ static mut WPP: u32 = 0;
 
 extern "C" {
     fn krust_pmm_alloc_frame() -> usize;
+    fn krust_pmm_free_frame(f: usize);
     fn krust_map_mmio(phys: u64, size: u64) -> u64;
     fn krust_serial_write(p: *const u8, l: usize);
     fn krust_serial_putchar(c: u8);
@@ -466,6 +467,192 @@ unsafe fn poll_hid(hid: &mut Hid) {
     }
     hid.toggle ^= 1;
     rearm_hid(hid);
+}
+
+// === Bulk Transfers (for USB Mass Storage) ===
+
+// Bulk OUT: send `len` bytes from `data` to device `addr` endpoint `ep`
+#[no_mangle]
+pub unsafe extern "C" fn krust_ehci_bulk_out(addr: u8, ep: u8, data: *const u8, len: usize) -> bool {
+    if addr == 0 || data.is_null() || len == 0 { return false; }
+    let dev_idx = (addr - 1) as usize;
+    if dev_idx >= NDEV { return false; }
+    let dev = &DEVS[dev_idx];
+    let maxp = dev.maxp as u32;
+    let speed = dev.speed;
+    let eid = ep & 0x7F;
+
+    // We need: a QH, qTDs, and a data buffer - all in one DMA page
+    let (pp, pv) = page_alloc();
+    if pv.is_null() { return false; }
+    ptr::write_bytes(pv, 0, 4096);
+
+    // Layout:
+    // [0..32]    QH
+    // [32..64]   qTD (active)
+    // [128..4096] data buffer
+    let qh = pv as *mut Qh;
+    let qhp = pp;
+    let td = pv.add(32) as *mut Qtd;
+    let tdp = pp + 32;
+    let data_buf = pv.add(128);
+    let data_phys = pp + 128;
+
+    // Copy data to DMA buffer (max one page)
+    let copy_len = if len > 3968 { 3968 } else { len };
+    ptr::copy_nonoverlapping(data, data_buf, copy_len);
+
+    // Build qTD for OUT transfer
+    ptr::write_volatile(ptr::addr_of_mut!((*td).next), LK_TERM);
+    ptr::write_volatile(ptr::addr_of_mut!((*td).alt), LK_TERM);
+    ptr::write_volatile(ptr::addr_of_mut!((*td).token),
+        ((copy_len as u32 & 0x7FFF) << 16) | QT_CERR | QT_PID_OUT | 0x80000000 | QT_IOC);
+    ptr::write_volatile(ptr::addr_of_mut!((*td).buf[0]), data_phys);
+    for i in 1..5 { ptr::write_volatile(ptr::addr_of_mut!((*td).buf[i]), 0); }
+    ptr::write_volatile(ptr::addr_of_mut!((*td)._rsvd), 0);
+
+    // Build QH for this endpoint
+    ptr::write_volatile(ptr::addr_of_mut!((*qh).next), LK_TERM);
+    ptr::write_volatile(ptr::addr_of_mut!((*qh).alt), tdp);
+    ptr::write_volatile(ptr::addr_of_mut!((*qh).epchar), qh_char(addr, eid, speed, maxp as u16));
+    ptr::write_volatile(ptr::addr_of_mut!((*qh).caps), (0x0F << 12));
+    ptr::write_volatile(ptr::addr_of_mut!((*qh).curr), 0);
+
+    // Link into async schedule and run
+    ptr::write_volatile(ptr::addr_of_mut!((*ANCHOR_QH).next), qhp);
+    ptr::write_volatile(ptr::addr_of_mut!((*ANCHOR_QH).caps), (0x0F << 12) | (0x00 << 0));
+    ww(CMD, rr(CMD) | CMD_ASE);
+    ww(CMD, rr(CMD) | CMD_IAAD);
+    for _ in 0..10000 { if rr(STS) & STS_AA != 0 { ww(STS, STS_AA); break; } }
+
+    let ok = wait_qtd(&*td);
+
+    // Cleanup
+    ptr::write_volatile(ptr::addr_of_mut!((*ANCHOR_QH).next), LK_TERM);
+    ww(CMD, rr(CMD) & !CMD_ASE);
+
+    // Free the DMA page
+    crate::pmm::krust_pmm_free_frame((pp / 4096) as usize);
+
+    ok
+}
+
+// Bulk IN: receive `len` bytes into `buf` from device `addr` endpoint `ep`
+#[no_mangle]
+pub unsafe extern "C" fn krust_ehci_bulk_in(addr: u8, ep: u8, buf: *mut u8, len: usize) -> bool {
+    if addr == 0 || buf.is_null() || len == 0 { return false; }
+    let dev_idx = (addr - 1) as usize;
+    if dev_idx >= NDEV { return false; }
+    let dev = &DEVS[dev_idx];
+    let maxp = dev.maxp as u32;
+    let speed = dev.speed;
+    let eid = ep & 0x7F;
+
+    let mut offset = 0usize;
+    let mut toggle = 0u32;
+    let mut overall_ok = true;
+
+    while offset < len && overall_ok {
+        let remaining = len - offset;
+        let chunk = if remaining > 3968 { 3968 } else { remaining };
+
+        let (pp, pv) = page_alloc();
+        if pv.is_null() { overall_ok = false; break; }
+        ptr::write_bytes(pv, 0, 4096);
+
+        let qh = pv as *mut Qh;
+        let qhp = pp;
+        let td = pv.add(32) as *mut Qtd;
+        let tdp = pp + 32;
+        let data_buf = pv.add(128);
+        let data_phys = pp + 128;
+
+        // Build qTD for IN transfer
+        ptr::write_volatile(ptr::addr_of_mut!((*td).next), LK_TERM);
+        ptr::write_volatile(ptr::addr_of_mut!((*td).alt), LK_TERM);
+        ptr::write_volatile(ptr::addr_of_mut!((*td).token),
+            ((chunk as u32 & 0x7FFF) << 16) | QT_CERR | QT_PID_IN
+            | (if toggle != 0 { 0x80000000 } else { 0 }) | QT_IOC);
+        ptr::write_volatile(ptr::addr_of_mut!((*td).buf[0]), data_phys);
+        for i in 1..5 { ptr::write_volatile(ptr::addr_of_mut!((*td).buf[i]), 0); }
+        ptr::write_volatile(ptr::addr_of_mut!((*td)._rsvd), 0);
+
+        // Build QH
+        ptr::write_volatile(ptr::addr_of_mut!((*qh).next), LK_TERM);
+        ptr::write_volatile(ptr::addr_of_mut!((*qh).alt), tdp);
+        ptr::write_volatile(ptr::addr_of_mut!((*qh).epchar), qh_char(addr, eid, speed, maxp as u16));
+        ptr::write_volatile(ptr::addr_of_mut!((*qh).caps), (0x0F << 12));
+        ptr::write_volatile(ptr::addr_of_mut!((*qh).curr), 0);
+
+        // Link into async and run
+        ptr::write_volatile(ptr::addr_of_mut!((*ANCHOR_QH).next), qhp);
+        ptr::write_volatile(ptr::addr_of_mut!((*ANCHOR_QH).caps), (0x0F << 12) | (0x00 << 0));
+        ww(CMD, rr(CMD) | CMD_ASE);
+        ww(CMD, rr(CMD) | CMD_IAAD);
+        for _ in 0..10000 { if rr(STS) & STS_AA != 0 { ww(STS, STS_AA); break; } }
+
+        let ok = wait_qtd(&*td);
+
+        ptr::write_volatile(ptr::addr_of_mut!((*ANCHOR_QH).next), LK_TERM);
+        ww(CMD, rr(CMD) & !CMD_ASE);
+
+        if ok {
+            ptr::copy_nonoverlapping(data_buf, buf.add(offset), chunk);
+        } else {
+            overall_ok = false;
+        }
+
+        crate::pmm::krust_pmm_free_frame((pp / 4096) as usize);
+        offset += chunk;
+        toggle ^= 1;
+    }
+
+    overall_ok
+}
+
+// Enumerate all EHCI devices for USB Mass Storage
+#[no_mangle]
+pub unsafe extern "C" fn krust_ehci_enumerate_storage() {
+    for i in 0..NDEV {
+        if !DEVS[i].active { continue; }
+        let addr = DEVS[i].addr;
+        let dbuf = WP.add(256);
+        if !get_cfg_desc(addr, dbuf, 9) { continue; }
+        let total = (*(dbuf as *const CfgDesc)).total;
+        if total > 512 { continue; }
+        if !get_cfg_desc(addr, dbuf, total) { continue; }
+
+        let mut off: usize = 0;
+        while off + 2 < total as usize {
+            let len = *dbuf.add(off) as usize;
+            let typ = *dbuf.add(off + 1);
+            if len == 0 || off + len > total as usize { break; }
+            if typ == 4 {  // DT_IFACE
+                let iface = &*(dbuf.add(off) as *const IfDesc);
+                if iface.cls == crate::usb_storage::MSC_CLASS && iface.sub == crate::usb_storage::MSC_SUBCLASS_SCSI && iface.proto == crate::usb_storage::MSC_PROTO_BBB {
+                    let mut ep_in: u8 = 0;
+                    let mut ep_out: u8 = 0;
+                    let mut max_pkt: u16 = 512;
+                    let mut eoff = off + iface.len as usize;
+                    while eoff + 2 < total as usize {
+                        let elen = *dbuf.add(eoff) as usize;
+                        let etyp = *dbuf.add(eoff + 1);
+                        if elen == 0 || eoff + elen > total as usize { break; }
+                        if etyp == 5 {  // DT_ENDP
+                            let ep = &*(dbuf.add(eoff) as *const EpDesc);
+                            if ep.addr & 0x80 != 0 { ep_in = ep.addr; max_pkt = ep.maxsz; }
+                            else { ep_out = ep.addr; }
+                        }
+                        eoff += elen;
+                    }
+                    if ep_in != 0 && ep_out != 0 {
+                        crate::usb_storage::register_storage(addr, ep_in, ep_out, max_pkt);
+                    }
+                }
+            }
+            off += len;
+        }
+    }
 }
 
 #[no_mangle]

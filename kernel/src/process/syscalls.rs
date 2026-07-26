@@ -37,7 +37,7 @@ fn is_user_range(ptr: *const u8, size: u64) -> bool {
 }
 
 fn copy_string_from_user(dst: *mut u8, src: *const u8, max: usize) -> i32 {
-    if !is_user_range(src, 1) {
+    if !is_user_range(src, max as u64) {
         return -1;
     }
     unsafe {
@@ -48,11 +48,6 @@ fn copy_string_from_user(dst: *mut u8, src: *const u8, max: usize) -> i32 {
             if c == 0 {
                 core::arch::asm!("clac");
                 return i as i32;
-            }
-            if !is_user_range(src.add(i), 1) {
-                ptr::write_volatile(dst.add(i), 0);
-                core::arch::asm!("clac");
-                return -1;
             }
         }
         ptr::write_volatile(dst.add(max - 1), 0);
@@ -90,12 +85,15 @@ fn copy_from_user(dst: *mut u8, src: *const u8, len: u64) -> i32 {
 }
 
 fn copy_cstr_to_user(dst: *mut u8, src: &[u8]) {
+    let len = src.len().min(64);
+    if !is_user_range(dst, len as u64 + 1) {
+        return;
+    }
     unsafe {
         core::arch::asm!("stac");
     }
     let mut i = 0;
-    let max = 64;
-    while i < src.len() && i < max && src[i] != 0 {
+    while i < src.len() && i < 64 && src[i] != 0 {
         unsafe { ptr::write_volatile(dst.add(i), src[i]); }
         i += 1;
     }
@@ -148,7 +146,7 @@ pub unsafe extern "C" fn syscall_handler_c(r: *mut Registers) {
     let arg5 = (*r).r8;
     let _arg6 = (*r).r9;
 
-    if num > 79 {
+    if num > 83 {
         (*r).rax = 0xFFFFFFFF;
         return;
     }
@@ -826,11 +824,15 @@ pub unsafe extern "C" fn syscall_handler_c(r: *mut Registers) {
             (*r).rax = result as u64;
         }
         44 => {
-            let fds = arg1 as *mut i32;
+            let fds = arg1 as *mut u8;
             let nfds = arg2;
             let timeout = arg3 as i32;
-            let result = crate::vfs::krust_vfs_poll(fds, nfds, timeout);
-            (*r).rax = result as u64;
+            if nfds == 0 || nfds > 1024 || !is_user_range(fds as *const u8, nfds * 8) {
+                (*r).rax = 0xFFFFFFFF;
+            } else {
+                let result = crate::vfs::krust_vfs_poll(fds as *mut crate::vfs::PollFdEntry, nfds, timeout);
+                (*r).rax = result as u64;
+            }
         }
         45 => {
             let nfds = arg1 as i32;
@@ -838,8 +840,18 @@ pub unsafe extern "C" fn syscall_handler_c(r: *mut Registers) {
             let writefds = arg3 as *mut u8;
             let exceptfds = arg4 as *mut u8;
             let timeout = arg5 as *mut u8;
-            let result = crate::vfs::krust_vfs_select(nfds, readfds, writefds, exceptfds, timeout);
-            (*r).rax = result as u64;
+            let bitmap_size = ((nfds as u32 + 7) / 8) as u64;
+            if nfds <= 0 || nfds > 1024
+                || (!readfds.is_null() && !is_user_range(readfds, bitmap_size))
+                || (!writefds.is_null() && !is_user_range(writefds, bitmap_size))
+                || (!exceptfds.is_null() && !is_user_range(exceptfds, bitmap_size))
+                || (!timeout.is_null() && !is_user_range(timeout as *const u8, 8))
+            {
+                (*r).rax = 0xFFFFFFFF;
+            } else {
+                let result = crate::vfs::krust_vfs_select(nfds, readfds, writefds, exceptfds, timeout);
+                (*r).rax = result as u64;
+            }
         }
         46 => {
             let flags = arg1;
@@ -1129,7 +1141,9 @@ pub unsafe extern "C" fn syscall_handler_c(r: *mut Registers) {
                             revents = 0x0020; // POLLNVAL
                         } else if events & 0x001 != 0 {
                             // POLLIN
-                            let has_data = if fd >= 0 && fd < MAX_FDS as i32 && fd_ref()[fd as usize].used {
+                            let has_data = if crate::vfs::is_pipe_fd(fd) {
+                                crate::vfs::pipe_has_data(fd)
+                            } else if fd >= 0 && fd < MAX_FDS as i32 && fd_ref()[fd as usize].used {
                                 let node = fd_ref()[fd as usize].node;
                                 if !node.is_null() && (*node).type_ == 0 {
                                     fd_ref()[fd as usize].offset < (*node).size
@@ -1142,8 +1156,13 @@ pub unsafe extern "C" fn syscall_handler_c(r: *mut Registers) {
                             if has_data { revents |= 0x001; }
                         }
                         if events & 0x004 != 0 {
-                            // POLLOUT — assume always writable
-                            revents |= 0x004;
+                            // POLLOUT
+                            let can_write = if crate::vfs::is_pipe_fd(fd) {
+                                crate::vfs::pipe_can_write(fd)
+                            } else {
+                                true // files are always writable in this OS
+                            };
+                            if can_write { revents |= 0x004; }
                         }
                         fds_buf[i].2 = revents;
                         if revents != 0 {
@@ -1251,8 +1270,12 @@ pub unsafe extern "C" fn syscall_handler_c(r: *mut Registers) {
         69 => {
             let current = crate::scheduler::krust_sched_current();
             if !current.is_null() {
-                (*current).uid = arg1 as u16;
-                (*r).rax = 0;
+                if (*current).uid == 0 {
+                    (*current).uid = arg1 as u16;
+                    (*r).rax = 0;
+                } else {
+                    (*r).rax = 0xFFFFFFFF;
+                }
             } else {
                 (*r).rax = 0xFFFFFFFF;
             }
@@ -1270,8 +1293,12 @@ pub unsafe extern "C" fn syscall_handler_c(r: *mut Registers) {
         71 => {
             let current = crate::scheduler::krust_sched_current();
             if !current.is_null() {
-                (*current).gid = arg1 as u16;
-                (*r).rax = 0;
+                if (*current).uid == 0 {
+                    (*current).gid = arg1 as u16;
+                    (*r).rax = 0;
+                } else {
+                    (*r).rax = 0xFFFFFFFF;
+                }
             } else {
                 (*r).rax = 0xFFFFFFFF;
             }
@@ -1296,66 +1323,86 @@ pub unsafe extern "C" fn syscall_handler_c(r: *mut Registers) {
         }
         // ─── 74: fchmod(fd, mode) ─────────────────────────────
         74 => {
-            let fd = arg1 as i32;
-            let mode = arg2 as u16;
-            if fd < 0 || fd >= MAX_FDS as i32 || !fd_ref()[fd as usize].used {
+            let current = crate::scheduler::krust_sched_current();
+            if current.is_null() || (*current).uid != 0 {
                 (*r).rax = 0xFFFFFFFF;
             } else {
-                let node = fd_ref()[fd as usize].node;
-                if !node.is_null() {
-                    (*node).mode = ((*node).mode & 0xF000) | (mode & 0x0FFF);
-                    (*r).rax = 0;
-                } else {
+                let fd = arg1 as i32;
+                let mode = arg2 as u16;
+                if fd < 0 || fd >= MAX_FDS as i32 || !fd_ref()[fd as usize].used {
                     (*r).rax = 0xFFFFFFFF;
+                } else {
+                    let node = fd_ref()[fd as usize].node;
+                    if !node.is_null() {
+                        (*node).mode = ((*node).mode & 0xF000) | (mode & 0x0FFF);
+                        (*r).rax = 0;
+                    } else {
+                        (*r).rax = 0xFFFFFFFF;
+                    }
                 }
             }
         }
         // ─── 75: fchown(fd, uid, gid) ─────────────────────────
         75 => {
-            let fd = arg1 as i32;
-            let uid = arg2 as u16;
-            let gid = arg3 as u16;
-            if fd < 0 || fd >= MAX_FDS as i32 || !fd_ref()[fd as usize].used {
+            let current = crate::scheduler::krust_sched_current();
+            if current.is_null() || (*current).uid != 0 {
                 (*r).rax = 0xFFFFFFFF;
             } else {
-                let node = fd_ref()[fd as usize].node;
-                if !node.is_null() {
-                    (*node).uid = uid;
-                    (*node).gid = gid;
-                    (*r).rax = 0;
-                } else {
+                let fd = arg1 as i32;
+                let uid = arg2 as u16;
+                let gid = arg3 as u16;
+                if fd < 0 || fd >= MAX_FDS as i32 || !fd_ref()[fd as usize].used {
                     (*r).rax = 0xFFFFFFFF;
+                } else {
+                    let node = fd_ref()[fd as usize].node;
+                    if !node.is_null() {
+                        (*node).uid = uid;
+                        (*node).gid = gid;
+                        (*r).rax = 0;
+                    } else {
+                        (*r).rax = 0xFFFFFFFF;
+                    }
                 }
             }
         }
         // ─── 76: chmod(path, mode) ────────────────────────────
         76 => {
-            let mut path_buf = [0u8; 256];
-            if copy_string_from_user(path_buf.as_mut_ptr(), arg1 as *const u8, 256) < 0 {
+            let current = crate::scheduler::krust_sched_current();
+            if current.is_null() || (*current).uid != 0 {
                 (*r).rax = 0xFFFFFFFF;
             } else {
-                let node = crate::vfs::krust_vfs_resolve(path_buf.as_ptr());
-                if !node.is_null() {
-                    (*node).mode = ((*node).mode & 0xF000) | (arg2 as u16 & 0x0FFF);
-                    (*r).rax = 0;
-                } else {
+                let mut path_buf = [0u8; 256];
+                if copy_string_from_user(path_buf.as_mut_ptr(), arg1 as *const u8, 256) < 0 {
                     (*r).rax = 0xFFFFFFFF;
+                } else {
+                    let node = crate::vfs::krust_vfs_resolve(path_buf.as_ptr());
+                    if !node.is_null() {
+                        (*node).mode = ((*node).mode & 0xF000) | (arg2 as u16 & 0x0FFF);
+                        (*r).rax = 0;
+                    } else {
+                        (*r).rax = 0xFFFFFFFF;
+                    }
                 }
             }
         }
         // ─── 77: chown(path, uid, gid) ────────────────────────
         77 => {
-            let mut path_buf = [0u8; 256];
-            if copy_string_from_user(path_buf.as_mut_ptr(), arg1 as *const u8, 256) < 0 {
+            let current = crate::scheduler::krust_sched_current();
+            if current.is_null() || (*current).uid != 0 {
                 (*r).rax = 0xFFFFFFFF;
             } else {
-                let node = crate::vfs::krust_vfs_resolve(path_buf.as_ptr());
-                if !node.is_null() {
-                    (*node).uid = arg2 as u16;
-                    (*node).gid = arg3 as u16;
-                    (*r).rax = 0;
-                } else {
+                let mut path_buf = [0u8; 256];
+                if copy_string_from_user(path_buf.as_mut_ptr(), arg1 as *const u8, 256) < 0 {
                     (*r).rax = 0xFFFFFFFF;
+                } else {
+                    let node = crate::vfs::krust_vfs_resolve(path_buf.as_ptr());
+                    if !node.is_null() {
+                        (*node).uid = arg2 as u16;
+                        (*node).gid = arg3 as u16;
+                        (*r).rax = 0;
+                    } else {
+                        (*r).rax = 0xFFFFFFFF;
+                    }
                 }
             }
         }
@@ -1405,6 +1452,356 @@ pub unsafe extern "C" fn syscall_handler_c(r: *mut Registers) {
                     fd_ref()[fd as usize].offset = (pos) as u32;
                     (*r).rax = if written > 0 { written as u64 } else { 0 };
                 }
+            }
+        }
+        // ─── 79: symlink(target, linkpath) ──────────────────
+        79 => {
+            let mut target_buf = [0u8; 256];
+            let mut linkpath_buf = [0u8; 256];
+            if copy_string_from_user(target_buf.as_mut_ptr(), arg1 as *const u8, 256) < 0 {
+                (*r).rax = 0xFFFFFFFF;
+            } else if copy_string_from_user(linkpath_buf.as_mut_ptr(), arg2 as *const u8, 256) < 0 {
+                (*r).rax = 0xFFFFFFFF;
+            } else {
+                (*r).rax = if crate::vfs::krust_vfs_symlink(target_buf.as_ptr(), linkpath_buf.as_ptr()) == 0 {
+                    0
+                } else {
+                    0xFFFFFFFF
+                };
+            }
+        }
+        // ─── 80: readlink(path, buf, bufsize) ──────────────
+        80 => {
+            let mut path_buf = [0u8; 256];
+            if copy_string_from_user(path_buf.as_mut_ptr(), arg1 as *const u8, 256) < 0 {
+                (*r).rax = 0xFFFFFFFF;
+            } else if arg2 == 0 || arg3 == 0 || !is_user_range(arg2 as *const u8, arg3) {
+                (*r).rax = 0xFFFFFFFF;
+            } else {
+                let result = crate::vfs::krust_vfs_readlink(path_buf.as_ptr(), arg2 as *mut u8, arg3 as u32);
+                (*r).rax = if result >= 0 { result as u64 } else { 0xFFFFFFFF };
+            }
+        }
+        // ─── 81: system(cmd_string) — fork+exec shell ──────
+        81 => {
+            (*r).rax = 0xFFFFFFFF;
+        }
+        // ─── 82: setenv(name, value) ──────────────────────
+        82 => {
+            let mut name_buf = [0u8; 64];
+            let mut val_buf = [0u8; 256];
+            if copy_string_from_user(name_buf.as_mut_ptr(), arg1 as *const u8, 64) < 0
+                || copy_string_from_user(val_buf.as_mut_ptr(), arg2 as *const u8, 256) < 0
+            {
+                (*r).rax = 0xFFFFFFFF;
+            } else {
+                let current = crate::scheduler::krust_sched_current();
+                if current.is_null() {
+                    (*r).rax = 0xFFFFFFFF;
+                } else {
+                    let t = &mut *current;
+                    let mut found = false;
+                    for i in 0..t.env_count as usize {
+                        if !t.env_keys[i].is_null() {
+                            let mut match_name = true;
+                            for j in 0..64 {
+                                let a = core::ptr::read_volatile(t.env_keys[i].add(j));
+                                let b = name_buf[j];
+                                if a != b || (a == 0 && b == 0) { if a != b { match_name = false; } break; }
+                            }
+                            if match_name {
+                                if !t.env_vals[i].is_null() { crate::heap::krust_free(t.env_vals[i]); }
+                                let vlen = val_buf.iter().position(|&c| c == 0).unwrap_or(255);
+                                let vptr = crate::heap::krust_malloc(vlen as u32 + 1);
+                                if !vptr.is_null() {
+                                    crate::klib::krust_memcpy(vptr, val_buf.as_ptr(), vlen + 1);
+                                }
+                                t.env_vals[i] = vptr;
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !found && t.env_count < 32 {
+                        let idx = t.env_count as usize;
+                        let nlen = name_buf.iter().position(|&c| c == 0).unwrap_or(63);
+                        let vlen = val_buf.iter().position(|&c| c == 0).unwrap_or(255);
+                        let nptr = crate::heap::krust_malloc(nlen as u32 + 1);
+                        let vptr = crate::heap::krust_malloc(vlen as u32 + 1);
+                        if !nptr.is_null() && !vptr.is_null() {
+                            crate::klib::krust_memcpy(nptr, name_buf.as_ptr(), nlen + 1);
+                            crate::klib::krust_memcpy(vptr, val_buf.as_ptr(), vlen + 1);
+                            t.env_keys[idx] = nptr;
+                            t.env_vals[idx] = vptr;
+                            t.env_count += 1;
+                            (*r).rax = 0;
+                        } else {
+                            if !nptr.is_null() { crate::heap::krust_free(nptr); }
+                            if !vptr.is_null() { crate::heap::krust_free(vptr); }
+                            (*r).rax = 0xFFFFFFFF;
+                        }
+                    } else {
+                        (*r).rax = 0;
+                    }
+                }
+            }
+        }
+        // ─── 83: getenv(name, buf, bufsize) ───────────────
+        83 => {
+            let mut name_buf = [0u8; 64];
+            if copy_string_from_user(name_buf.as_mut_ptr(), arg1 as *const u8, 64) < 0 {
+                (*r).rax = 0xFFFFFFFF;
+            } else if arg2 == 0 || arg3 == 0 || !is_user_range(arg2 as *const u8, arg3) {
+                (*r).rax = 0xFFFFFFFF;
+            } else {
+                let current = crate::scheduler::krust_sched_current();
+                if current.is_null() {
+                    (*r).rax = 0xFFFFFFFF;
+                } else {
+                    let t = &*current;
+                    let mut result: i64 = 0xFFFFFFFF;
+                    for i in 0..t.env_count as usize {
+                        if !t.env_keys[i].is_null() {
+                            let mut match_name = true;
+                            for j in 0..64 {
+                                let a = core::ptr::read_volatile(t.env_keys[i].add(j));
+                                let b = name_buf[j];
+                                if a != b || (a == 0 && b == 0) { if a != b { match_name = false; } break; }
+                            }
+                            if match_name {
+                                if !t.env_vals[i].is_null() {
+                                    let mut vlen: usize = 0;
+                                    while core::ptr::read_volatile(t.env_vals[i].add(vlen)) != 0 { vlen += 1; }
+                                    let copy_len = core::cmp::min(vlen, arg3 as usize - 1);
+                                    core::arch::asm!("stac");
+                                    for j in 0..copy_len {
+                                        let c = core::ptr::read_volatile((arg2 as *mut u8).add(j));
+                                        core::ptr::write_volatile((arg2 as *mut u8).add(j), c);
+                                    }
+                                    core::ptr::write_volatile((arg2 as *mut u8).add(copy_len), 0u8);
+                                    core::arch::asm!("clac");
+                                    result = copy_len as i64;
+                                } else {
+                                    core::arch::asm!("stac");
+                                    core::ptr::write_volatile(arg2 as *mut u8, 0u8);
+                                    core::arch::asm!("clac");
+                                    result = 0;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    (*r).rax = result as u64;
+                }
+            }
+        }
+        // ─── 84: ps(buf, bufsize) — list all processes ──────
+        84 => {
+            if arg1 == 0 || arg3 == 0 || !is_user_range(arg1 as *const u8, arg3) {
+                (*r).rax = 0xFFFFFFFF;
+            } else {
+                let mut kbuf = [0u8; 4096];
+                let len = crate::fs::procfs::proc_list_processes(&mut kbuf);
+                let copy_len = core::cmp::min(len, arg3 as usize - 1);
+                core::arch::asm!("stac");
+                for i in 0..copy_len {
+                    core::ptr::write_volatile((arg1 as *mut u8).add(i), kbuf[i]);
+                }
+                core::ptr::write_volatile((arg1 as *mut u8).add(copy_len), 0u8);
+                core::arch::asm!("clac");
+                (*r).rax = copy_len as u64;
+            }
+        }
+        // ─── 85: free_info(total_ptr, free_ptr) — memory info ─
+        85 => {
+            if arg1 != 0 && arg2 != 0 {
+                let mut total_kb: u32 = 0;
+                let mut free_kb: u32 = 0;
+                crate::mm::mm::krust_mm_info(&mut total_kb, &mut free_kb);
+                core::arch::asm!("stac");
+                core::ptr::write_volatile(arg1 as *mut u32, total_kb);
+                core::ptr::write_volatile(arg2 as *mut u32, free_kb);
+                core::arch::asm!("clac");
+                (*r).rax = 0;
+            } else {
+                (*r).rax = 0xFFFFFFFF;
+            }
+        }
+        // ─── 86: list_env(buf, bufsize) — list all env vars ──
+        86 => {
+            if arg1 == 0 || arg3 == 0 || !is_user_range(arg1 as *const u8, arg3) {
+                (*r).rax = 0xFFFFFFFF;
+            } else {
+                let current = crate::scheduler::krust_sched_current();
+                if current.is_null() {
+                    (*r).rax = 0xFFFFFFFF;
+                } else {
+                    let t = &*current;
+                    let mut kbuf = [0u8; 4096];
+                    let mut pos = 0;
+                    for i in 0..t.env_count as usize {
+                        if !t.env_keys[i].is_null() {
+                            // key=value\n
+                            let mut j = 0;
+                            while j < 64 {
+                                let c = core::ptr::read_volatile(t.env_keys[i].add(j));
+                                if c == 0 || pos >= kbuf.len() - 2 { break; }
+                                kbuf[pos] = c; pos += 1; j += 1;
+                            }
+                            if pos < kbuf.len() { kbuf[pos] = b'='; pos += 1; }
+                            if !t.env_vals[i].is_null() {
+                                let mut j = 0;
+                                while j < 256 {
+                                    let c = core::ptr::read_volatile(t.env_vals[i].add(j));
+                                    if c == 0 || pos >= kbuf.len() - 2 { break; }
+                                    kbuf[pos] = c; pos += 1; j += 1;
+                                }
+                            }
+                            if pos < kbuf.len() { kbuf[pos] = b'\n'; pos += 1; }
+                        }
+                    }
+                    let copy_len = core::cmp::min(pos, arg3 as usize - 1);
+                    core::arch::asm!("stac");
+                    for i in 0..copy_len {
+                        core::ptr::write_volatile((arg1 as *mut u8).add(i), kbuf[i]);
+                    }
+                    core::ptr::write_volatile((arg1 as *mut u8).add(copy_len), 0u8);
+                    core::arch::asm!("clac");
+                    (*r).rax = copy_len as u64;
+                }
+            }
+        }
+        // ─── 87: proc_info(pid, buf, bufsize) — per-process info ──
+        87 => {
+            let target_pid = arg1 as u32;
+            if arg2 == 0 || arg3 == 0 || !is_user_range(arg2 as *const u8, arg3) {
+                (*r).rax = 0xFFFFFFFF;
+            } else {
+                let next_id = crate::scheduler::krust_sched_get_next_id();
+                let task = crate::scheduler::krust_sched_get_task(target_pid);
+                if task.is_null() || target_pid >= next_id {
+                    (*r).rax = 0xFFFFFFFF;
+                } else {
+                    let t = &*task;
+                    let mut kbuf = [0u8; 1024];
+                    let mut pos = 0;
+                    let state_str: [u8; 9] = match t.state {
+                        crate::scheduler::TaskState::RUNNING | crate::scheduler::TaskState::READY => *b"running\0\0",
+                        crate::scheduler::TaskState::BLOCKED | crate::scheduler::TaskState::WAITING => *b"sleeping\0",
+                        crate::scheduler::TaskState::EXITED => *b"zombie\0\0\0",
+                    };
+                    let state_len = match t.state {
+                        crate::scheduler::TaskState::RUNNING | crate::scheduler::TaskState::READY => 7usize,
+                        crate::scheduler::TaskState::BLOCKED | crate::scheduler::TaskState::WAITING => 8usize,
+                        crate::scheduler::TaskState::EXITED => 6usize,
+                    };
+                    crate::fs::procfs::append_str(&mut kbuf, &mut pos, b"Name:  \0");
+                    crate::fs::procfs::append_str(&mut kbuf, &mut pos, &state_str[..state_len]);
+                    crate::fs::procfs::append_str(&mut kbuf, &mut pos, b"\n\0");
+                    crate::fs::procfs::append_str(&mut kbuf, &mut pos, b"Pid:   \0");
+                    crate::fs::procfs::append_u32(&mut kbuf, &mut pos, t.id);
+                    crate::fs::procfs::append_str(&mut kbuf, &mut pos, b"\n\0");
+                    crate::fs::procfs::append_str(&mut kbuf, &mut pos, b"PPid:  \0");
+                    crate::fs::procfs::append_u32(&mut kbuf, &mut pos, t.ppid);
+                    crate::fs::procfs::append_str(&mut kbuf, &mut pos, b"\n\0");
+                    crate::fs::procfs::append_str(&mut kbuf, &mut pos, b"Uid:   \0");
+                    crate::fs::procfs::append_u32(&mut kbuf, &mut pos, t.uid as u32);
+                    crate::fs::procfs::append_str(&mut kbuf, &mut pos, b"\n\0");
+                    crate::fs::procfs::append_str(&mut kbuf, &mut pos, b"Gid:   \0");
+                    crate::fs::procfs::append_u32(&mut kbuf, &mut pos, t.gid as u32);
+                    crate::fs::procfs::append_str(&mut kbuf, &mut pos, b"\n\0");
+                    crate::fs::procfs::append_str(&mut kbuf, &mut pos, b"State: \0");
+                    let state_char = match t.state {
+                        crate::scheduler::TaskState::RUNNING | crate::scheduler::TaskState::READY => b'R',
+                        crate::scheduler::TaskState::BLOCKED | crate::scheduler::TaskState::WAITING => b'S',
+                        crate::scheduler::TaskState::EXITED => b'Z',
+                    };
+                    kbuf[pos] = state_char; pos += 1;
+                    crate::fs::procfs::append_str(&mut kbuf, &mut pos, b"\n\0");
+                    crate::fs::procfs::append_str(&mut kbuf, &mut pos, b"Prio:  \0");
+                    crate::fs::procfs::append_u32(&mut kbuf, &mut pos, t.priority);
+                    crate::fs::procfs::append_str(&mut kbuf, &mut pos, b"\n\0");
+                    let copy_len = core::cmp::min(pos, arg3 as usize - 1);
+                    core::arch::asm!("stac");
+                    for i in 0..copy_len {
+                        core::ptr::write_volatile((arg2 as *mut u8).add(i), kbuf[i]);
+                    }
+                    core::ptr::write_volatile((arg2 as *mut u8).add(copy_len), 0u8);
+                    core::arch::asm!("clac");
+                    (*r).rax = copy_len as u64;
+                }
+            }
+        }
+        // ─── 88: setpgid(pid, pgid) ──
+        88 => {
+            let target_pid = arg1 as u32;
+            let new_pgid = arg2 as u32;
+            let current = crate::scheduler::krust_sched_current();
+            if current.is_null() {
+                (*r).rax = 0xFFFFFFFF;
+            } else {
+                let actual_pid = if target_pid == 0 { (*current).id } else { target_pid };
+                let actual_pgid = if new_pgid == 0 { actual_pid } else { new_pgid };
+                let task = crate::scheduler::krust_sched_get_task(actual_pid);
+                if task.is_null() {
+                    (*r).rax = 0xFFFFFFFF;
+                } else {
+                    (*task).pgid = actual_pgid;
+                    (*r).rax = 0;
+                }
+            }
+        }
+        // ─── 89: getpgid(pid) ──
+        89 => {
+            let target_pid = arg1 as u32;
+            let current = crate::scheduler::krust_sched_current();
+            if current.is_null() {
+                (*r).rax = 0xFFFFFFFF;
+            } else {
+                let actual_pid = if target_pid == 0 { (*current).id } else { target_pid };
+                let task = crate::scheduler::krust_sched_get_task(actual_pid);
+                if task.is_null() {
+                    (*r).rax = 0xFFFFFFFF;
+                } else {
+                    (*r).rax = (*task).pgid as u64;
+                }
+            }
+        }
+        // ─── 90: getsid(pid) ──
+        90 => {
+            let target_pid = arg1 as u32;
+            let current = crate::scheduler::krust_sched_current();
+            if current.is_null() {
+                (*r).rax = 0xFFFFFFFF;
+            } else {
+                let actual_pid = if target_pid == 0 { (*current).id } else { target_pid };
+                let task = crate::scheduler::krust_sched_get_task(actual_pid);
+                if task.is_null() {
+                    (*r).rax = 0xFFFFFFFF;
+                } else {
+                    (*r).rax = (*task).sid as u64;
+                }
+            }
+        }
+        // ─── 91: setsid() ──
+        91 => {
+            let current = crate::scheduler::krust_sched_current();
+            if current.is_null() {
+                (*r).rax = 0xFFFFFFFF;
+            } else {
+                let new_sid = (*current).id;
+                (*current).sid = new_sid;
+                (*current).pgid = new_sid;
+                (*r).rax = new_sid as u64;
+            }
+        }
+        // ─── 92: getpgrp() ──
+        92 => {
+            let current = crate::scheduler::krust_sched_current();
+            if current.is_null() {
+                (*r).rax = 0xFFFFFFFF;
+            } else {
+                (*r).rax = (*current).pgid as u64;
             }
         }
         _ => {

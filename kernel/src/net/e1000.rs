@@ -197,9 +197,13 @@ impl E1000Device {
             return;
         }
         unsafe {
-            let next = (self.rx_cur + 1) % NUM_RX_DESC;
-            let desc = self.rx_descs.add(self.rx_cur).read_volatile();
-            if desc.status & RX_STA_DD != 0 {
+            // Drain all available received packets
+            loop {
+                let desc = self.rx_descs.add(self.rx_cur).read_volatile();
+                if desc.status & RX_STA_DD == 0 {
+                    break;
+                }
+                let next = (self.rx_cur + 1) % NUM_RX_DESC;
                 self.mmio_write(REG_RDT, self.rx_cur as u32);
                 self.rx_cur = next;
             }
@@ -315,7 +319,38 @@ pub fn get_mmio_base() -> *mut uint32_t { *E1000_MMIO_BASE.lock() as *mut uint32
 
 use crate::scheduler::Registers;
 
+use crate::spinlock::SpinLock;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+static E1000_IRQ_COUNT: AtomicU32 = AtomicU32::new(0);
+static E1000_IRQ_THROTTLE: SpinLock<bool> = SpinLock::new(false);
+
 pub extern "C" fn e1000_irq_handler(_r: *mut Registers) {
+    let count = E1000_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    // Throttle: if we've had too many interrupts in rapid succession, skip processing
+    // This prevents interrupt storms while still allowing正常 traffic through polling
+    {
+        let mut throttle = E1000_IRQ_THROTTLE.lock();
+        if *throttle {
+            // Acknowledge and EOI, but don't process - let polling handle it
+            let mmio = *E1000_MMIO_BASE.lock() as *mut uint32_t;
+            if !mmio.is_null() {
+                unsafe {
+                    let icr = mmio.add((0x00D8 / 4) as usize).read_volatile();
+                    mmio.add((0x00D8 / 4) as usize).write_volatile(icr);
+                }
+            }
+            unsafe { crate::apic_hw::krust_apic_eoi(); }
+            return;
+        }
+
+        // After 100 interrupts without a break, start throttling
+        if count % 100 == 99 {
+            *throttle = true;
+        }
+    }
+
     let mmio = *E1000_MMIO_BASE.lock() as *mut uint32_t;
     if mmio.is_null() { return; }
 
@@ -323,6 +358,12 @@ pub extern "C" fn e1000_irq_handler(_r: *mut Registers) {
     unsafe { mmio.add((0x00D8 / 4) as usize).write_volatile(icr); }
 
     unsafe { crate::net::krust_net_poll(); }
+
+    // Reset throttle after successful processing
+    {
+        let mut throttle = E1000_IRQ_THROTTLE.lock();
+        *throttle = false;
+    }
 
     unsafe { crate::apic_hw::krust_apic_eoi(); }
 }

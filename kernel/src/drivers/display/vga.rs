@@ -4,6 +4,110 @@ const VGA_BUF: *mut u16 = 0xB8000 as *mut u16;
 const WIDTH: usize = 80;
 const HEIGHT: usize = 25;
 
+// Bochs/QEMU VBE registers
+const VBE_INDEX: u16 = 0x1CE;
+const VBE_DATA: u16 = 0x1CF;
+const VBE_XRES: u16 = 1;
+const VBE_YRES: u16 = 2;
+const VBE_BPP: u16 = 3;
+const VBE_ENABLE: u16 = 8;
+const VBE_BANK: u16 = 9;
+const VBE_VIRT_WIDTH: u16 = 4;
+const VBE_VIRT_HEIGHT: u16 = 5;
+
+// Current VGA mode
+static mut VGA_MODE_FB: *mut u8 = 0 as *mut u8;
+static mut VGA_MODE_W: u32 = 0;
+static mut VGA_MODE_H: u32 = 0;
+static mut VGA_MODE_PITCH: u32 = 0;
+
+unsafe fn vbe_write(reg: u16, val: u16) {
+    core::arch::asm!("out dx, ax", in("dx") VBE_INDEX, in("ax") reg);
+    core::arch::asm!("out dx, ax", in("dx") VBE_DATA, in("ax") val);
+}
+
+unsafe fn vbe_read(reg: u16) -> u16 {
+    let val: u16;
+    core::arch::asm!("out dx, ax", in("dx") VBE_INDEX, in("ax") reg);
+    core::arch::asm!("in ax, dx", out("ax") val, in("dx") VBE_DATA);
+    val
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn krust_vga_vbe_init() -> bool {
+    use crate::pci::PCI;
+
+    // Check if VBE is available by reading ID
+    let id = vbe_read(0);
+    if id != 0xB0C5 {
+        return false;
+    }
+
+    // Find VGA device on PCI (class 0x03, subclass 0x00)
+    if let Some(vga) = PCI::enumerate_class(0x03, 0x00) {
+        // Enable memory space access on PCI command register
+        let mut cmd = PCI::config_read_word(vga.bus, vga.slot, vga.func, 0x04);
+        cmd |= 1 << 1; // Memory Space Enable
+        PCI::config_write_word(vga.bus, vga.slot, vga.func, 0x04, cmd);
+
+        // Read BAR0 for framebuffer address
+        let bar0 = PCI::read_bar(vga.bus, vga.slot, vga.func, 0);
+        let fb_phys = (bar0 & 0xFFFFFFF0) as u64;
+
+        if fb_phys == 0 {
+            return false;
+        }
+
+        // Disable display while changing mode
+        vbe_write(VBE_ENABLE, 0);
+
+        // Set 1024x768x32
+        vbe_write(VBE_XRES, 1024);
+        vbe_write(VBE_YRES, 768);
+        vbe_write(VBE_BPP, 32);
+
+        // Set virtual framebuffer size (for double buffering)
+        vbe_write(VBE_VIRT_WIDTH, 1024);
+        vbe_write(VBE_VIRT_HEIGHT, 768 * 2);
+
+        // Enable linear framebuffer (bit 0 = enable, bit 5 = linear FB)
+        vbe_write(VBE_ENABLE, 0x41);
+
+        // Read back actual resolution (QEMU may have adjusted)
+        let w = vbe_read(VBE_XRES) as u32;
+        let h = vbe_read(VBE_YRES) as u32;
+        let bpp = vbe_read(VBE_BPP) as u32;
+
+        // Map framebuffer into kernel address space (identity map covers first 4GB)
+        let fb_ptr = fb_phys as *mut u8;
+
+        VGA_MODE_FB = fb_ptr;
+        VGA_MODE_W = w;
+        VGA_MODE_H = h;
+        VGA_MODE_PITCH = w * (bpp / 8);
+
+        // Fill with black
+        let total = (VGA_MODE_PITCH * VGA_MODE_H) as usize;
+        let fb32 = fb_ptr as *mut u32;
+        for i in 0..(total / 4) {
+            ptr::write_volatile(fb32.add(i), 0x00000000);
+        }
+
+        // Init fb_console with the detected framebuffer
+        crate::fb_console::fb_console_init(w, h, VGA_MODE_PITCH, bpp as u8, fb_ptr);
+
+        return true;
+    }
+
+    false
+}
+
+pub unsafe fn vga_mode_fb() -> *mut u8 { VGA_MODE_FB }
+pub unsafe fn vga_mode_w() -> u32 { VGA_MODE_W }
+pub unsafe fn vga_mode_h() -> u32 { VGA_MODE_H }
+pub unsafe fn vga_mode_pitch() -> u32 { VGA_MODE_PITCH }
+pub unsafe fn vga_mode_active() -> bool { !VGA_MODE_FB.is_null() }
+
 static mut ROW: usize = 0;
 static mut COL: usize = 0;
 static mut COLOR: u8 = 0x07; // light gray on black

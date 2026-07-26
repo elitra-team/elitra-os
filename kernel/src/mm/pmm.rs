@@ -81,22 +81,28 @@ pub unsafe extern "C" fn krust_pmm_free_frames(bitmap: *mut u8, start_frame: usi
 
 #[no_mangle]
 pub unsafe extern "C" fn krust_pmm_alloc_frame() -> usize {
+    let flags: u64;
+    core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
     while PMM_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
         core::hint::spin_loop();
     }
     let frame = find_first_free();
     if frame == !0 {
         PMM_LOCK.store(false, Ordering::Release);
+        core::arch::asm!("push {f}; popfq", f = in(reg) flags, options(nostack));
         return !0;
     }
     bitmap_set(frame);
     FIRST_FREE.store(frame + 1, Ordering::Relaxed);
     PMM_LOCK.store(false, Ordering::Release);
+    core::arch::asm!("push {f}; popfq", f = in(reg) flags, options(nostack));
     frame
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn krust_pmm_free_frame(frame: usize) {
+    let flags: u64;
+    core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
     while PMM_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
         core::hint::spin_loop();
     }
@@ -106,6 +112,7 @@ pub unsafe extern "C" fn krust_pmm_free_frame(frame: usize) {
         FIRST_FREE.store(frame, Ordering::Relaxed);
     }
     PMM_LOCK.store(false, Ordering::Release);
+    core::arch::asm!("push {f}; popfq", f = in(reg) flags, options(nostack));
 }
 
 #[no_mangle]

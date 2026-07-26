@@ -1,25 +1,26 @@
 # Elitra OS
 
-64-bit hobby kernel for x86-64, written entirely in **Rust** (`#![no_std]`) with NASM assembly for boot, interrupts, context switch, and SMP trampoline. Userspace utilities are also written in Rust (custom rust-rt runtime, no libc).
+64-bit hobby kernel for x86-64, written in **Rust** (`#![no_std]`) with NASM assembly for boot, interrupts, context switch, and SMP trampoline. Userspace utilities also in Rust (custom rust-rt runtime, no libc).
 
 ## Features
 
 ### Kernel
 
-- Boot via GRUB (Multiboot2) or directly QEMU (PVH ELF Note)
+- Boot via GRUB (Multiboot2), QEMU direct, or PVH ELF Note
 - **64-bit long mode** (x86-64), 4-level paging with 2MB huge pages
-- NX (No-Execute) bit, SMEP/SMAP — hardware memory protection (conditional on CPUID)
+- NX (No-Execute) bit, SMEP/SMAP — hardware memory protection
 - APIC/LAPIC/IOAPIC — advanced interrupt controller (8259 PIC disabled)
-- **SMP** — trampoline (16→32→64 bit) for APs, INIT-SIPI-SIPI, per-CPU scheduler state, SpinLock
-- Physical memory allocator (PMM bitmap) + heap allocator (Rust)
-- **VMA subsystem** — virtual memory management (mmap, munmap, brk, mprotect)
-- **Copy-on-Write** fork via reference counting table in Rust
+- **SMP** — trampoline (16→32→64 bit) for APs, INIT-SIPI-SIPI, per-CPU scheduler state, SpinLock, IPI reschedule
+- Physical memory allocator (PMM bitmap) + heap allocator (Rust free-list)
+- **VMA subsystem** — mmap, munmap, brk, mprotect
+- **Copy-on-Write** fork via reference counting
 - Interrupts (IDT, APIC/PIC) + Task State Segment (TSS)
 - Syscall fast path via MSR (IA32_STAR/LSTAR/FMASK) + `int 0x80`
 - FPU/SSE context save/restore (FXSAVE/FXRSTOR)
 - System timers (PIT 100Hz, LAPIC timer, HPET)
-- **79 syscalls** (see Syscalls section)
+- **93 syscalls** (see Syscalls section)
 - File permission model (uid/gid/mode bits, check_permission)
+- ACPI (RSDP/RSDT/FADT/DSDT/MADT) — shutdown, reboot, APIC discovery
 
 ### Drivers
 
@@ -27,27 +28,28 @@
 - **AHCI** — SATA controller (DMA, PRD, bounce buffers, LBA48)
 - **NVMe** — NVM Express controller (admin/I/O queues, identify, read/write sectors, PCI enumeration)
 - **VirtIO Block** — MMIO transport, virtqueue management, feature negotiation
-- **USB UHCI** (USB 1.x) + **EHCI** (USB 2.0) — full stack in Rust, HID keyboard/mouse
-- **VGA text** (80×25) in Rust
-- **Framebuffer** (VBE, configurable resolution) in Rust — put_pixel, fill_rect, draw_char
+- **USB UHCI** (USB 1.x) + **EHCI** (USB 2.0) — full stack, HID keyboard/mouse, USB mass storage
+- **VGA text** (80x25) in Rust
+- **Framebuffer** — VBE graphics mode (1024x768x32) with Bochs/QEMU auto-detection, put_pixel, fill_rect, draw_char
 - **GUI Compositor** — windowing system with drag-and-drop, z-order, taskbar, event queue, mouse cursor
-- **Terminal** in Rust — 4 virtual terminals (F1–F4), scrollback (PgUp/PgDn)
-- PS/2 keyboard + mouse (mouse in Rust)
-- CMOS RTC (real-time clock) in Rust
-- PIT timer in Rust (100 Hz)
-- ATA PIO + DMA (Bus Mastering), write-back cache for FAT32 in Rust
+- **Terminal** — 4 virtual terminals (F1–F4), scrollback (PgUp/PgDn), status bar
+- PS/2 keyboard + mouse
+- CMOS RTC (real-time clock)
+- PIT timer (100 Hz)
+- ATA PIO + DMA (Bus Mastering), write-back cache for FAT32
 - Intel e1000 (network adapter — ARP/UDP/ICMP over Ethernet)
-- **TCP/IP** — full TCP state machine (SYN/ACK/FIN/RST), flow control (send window, backpressure), retransmission timer with exponential backoff
+- **TCP/IP** — full TCP state machine (SYN/ACK/FIN/RST), flow control, retransmission timer with exponential backoff
 - **DHCP** — automatic network configuration
-- ACPI (RSDP/RSDT/FADT/DSDT/MADT) — shutdown, reboot, APIC discovery
-- Serial port (NS16550, debug) in Rust
+- **DNS** — domain name resolution
+- Serial port (NS16550, debug)
 - PCI config space read/write + **PCI bus enumeration** (by vendor/device and class/subclass)
 
 ### Filesystems
 
-- **FAT32** — read/write in Rust (boot sector, cluster chain, file CRUD, directory ops)
-- **ext2** — read/write in Rust (superblock, block group descriptors, inode read/write)
+- **FAT32** — read/write (boot sector, cluster chain, file CRUD, directory ops)
+- **ext2** — read/write (superblock, block group descriptors, inode read/write)
 - **VFS** — unified virtual filesystem (VNode tree, mount table, device nodes, fd table, file permissions)
+- **/proc** — process info, PCI device listing
 - Pipes, output redirection, mount/unmount
 
 ### Multitasking
@@ -55,7 +57,7 @@
 - Preemptive (PIT, 100 Hz), scheduler in Rust
 - **SMP** — per-CPU scheduler state, SpinLock for ready/sleep queue, INIT-SIPI-SIPI AP startup
 - FPU/SSE context save/restore
-- ELF loader in Rust (32-bit and 64-bit static ELF)
+- ELF loader (32-bit and 64-bit static ELF)
 - **User-mode processes** (ring 3), up to 64 tasks
 - Signals (SIGKILL, SIGSEGV, SIGTERM, SIGCHLD)
 - waitpid, process tree, zombie collection
@@ -64,7 +66,7 @@
 
 ### Syscalls
 
-79 system calls via `int 0x80` + MSR fast path:
+93 system calls via `int 0x80` + MSR fast path:
 
 | Category | Syscalls |
 |---|---|
@@ -79,22 +81,25 @@
 | Network | socket, connect, sendto, recvfrom, bind, close_socket, listen, accept |
 | Time | clock_gettime (CLOCK_MONOTONIC, CLOCK_REALTIME), nanosleep, sleep, get_rtc |
 | Terminal | ioctl (TIOCGWINSZ, FIONREAD, TIOCSCTTY), poll, select, getchar |
-| System | uname, reboot, poweroff, chdir, getcwd, clear_screen, arch_prctl |
+| System | uname, reboot, poweroff, chdir, getcwd, clear_screen, arch_prctl, ps, free_info, list_env, proc_info, setpgid, getpgid, getsid, setsid, getpgrp |
 
 ### Userspace
 
-- Built-in shell (kernel shell) with 31 commands
-- 24 ELF programs on Rust (init, cat, ls, echo, cp, mv, pwd, tee, sleep, seq, yes, clear, mkdir, rm, rmdir, touch, basename, dirname, which, true, false, env, uname)
+- Built-in kernel shell with **38 commands**
+- **55 ELF programs** on Rust (init, cat, ls, echo, cp, mv, pwd, tee, sleep, seq, yes, clear, mkdir, rm, rmdir, touch, basename, dirname, which, true, false, env, uname, chmod, cut, date, df, diff, du, find, free, grep, halt, head, id, kill, ln, lsof, mount, nproc, ping, procinfo, reboot, shutdown, sort, strace, tail, test_cmd, tr, umount, uptime, wc, whoami, xargs)
 - Pipe (`|`) and output redirection (`>`) support
+- Login screen before shell
+- Colored `ls` with file type indicators
+- neofetch, tree, top, cowsay built-ins
 - Init process (auto-starts on `/mnt/bin/init.elf`)
 
 ## Architecture
 
 | Component | Language | Lines of code |
 |---|---|---|
-| Kernel (drivers, FS, scheduler, VMM, COW, networking, GUI, SMP, syscalls) | Rust | ~18 000+ |
-| Userspace utilities (24 .elf) | Rust | ~2 000 |
-| Boot, interrupts, context switch, trampoline | ASM (nasm) | ~700 |
+| Kernel (drivers, FS, scheduler, VMM, COW, networking, GUI, SMP, syscalls) | Rust | ~25 000 |
+| Userspace utilities (55 .elf) | Rust | ~4 800 |
+| Boot, interrupts, context switch, trampoline | ASM (nasm) | ~800 |
 
 ```
                  .─────────.
@@ -120,18 +125,16 @@
                   ▼
          ┌──────────────────────────────┐
          │  rust-rt userspace .elf      │
-         │  init, ls, cat, echo ...     │
+         │  55 programs, init, ls ...   │
          └──────────────────────────────┘
 ```
 
 ## Building and Running
 
-### Quick start (PVH, TCG)
+### Quick start (PVH)
 ```
 make -j$(nproc)
-qemu-system-x86_64 -kernel elitra-kernel.bin -m 256M \
-  -drive file=fat32.img,format=raw,index=0,media=disk \
-  -machine accel=tcg -nographic -no-reboot -no-shutdown
+make run
 ```
 
 ### GRUB (ISO)
@@ -154,9 +157,9 @@ qemu-system-x86_64 -cdrom elitra.iso -m 256M \
 
 ### Dependencies
 - `nasm`, `ld` (binutils)
-- `rustc +nightly` (for krust and userspace programs)
+- `rustc +nightly` (for kernel and userspace)
 - `cargo +nightly -Z build-std`
-- `mtools` (mcopy, mmd — for fat32.img)
+- `mtools` (mcopy, mmd — for disk.img)
 - `grub-mkrescue` (for ISO image)
 - `qemu-system-x86_64`
 
@@ -166,8 +169,8 @@ qemu-system-x86_64 -cdrom elitra.iso -m 256M \
 |---|---|
 | `?` / `help` | Show help |
 | `clr` | Clear screen |
-| `echo` / `say <text>` | Print text to terminal |
-| `list [path]` | List directory contents |
+| `echo` / `say <text>` | Print text |
+| `list [path]` | List directory (colored, with type indicators) |
 | `dump <file>` | Display file contents |
 | `create <path>` | Create empty file |
 | `del <path>` | Delete file or node |
@@ -175,25 +178,28 @@ qemu-system-x86_64 -cdrom elitra.iso -m 256M \
 | `put <path> <text>` | Write text to file |
 | `exec <file>` | Execute ELF binary |
 | `cd [path]` | Change directory |
-| `ps` | Show process list |
+| `ps` | Process list |
 | `kill <pid>` | Kill process by PID |
-| `df` | Show disk usage |
-| `date` | Show current date |
-| `mem` | Show memory information |
-| `cpu` | Show CPU information |
-| `upt` | Show uptime |
-| `ver` | Show version |
+| `df` | Disk usage |
+| `date` | Current date/time |
+| `mem` | Memory information |
+| `cpu` | CPU information |
+| `lspci` | PCI devices |
+| `dmesg` | Kernel log |
+| `neo` / `neofetch` | System info with ASCII art |
+| `tree [path]` | Directory tree |
+| `top` | Process monitor |
+| `cowsay` / `moo` | ASCII cow |
+| `upt` | Uptime |
+| `ver` | Version |
 | `rst` | Reboot |
 | `off` | Shut down |
-| `mnt` | List mounted filesystems |
-| `unm <path>` | Unmount filesystem |
+| `mnt` | Mounted filesystems |
+| `unm <path>` | Unmount |
 | `sync` | Flush to disk |
-| `ata` | ATA drive information |
-| `fs` | VFS information |
-| `jobs` | Task information |
-| `newt` | Create test tasks |
-| `mall` | Test allocator |
-| `pt` | Test paging |
+| `ata` | ATA drive info |
+| `fs` | VFS info |
+| `jobs` | Task info |
 
 Terminal: **F1–F4** — virtual terminals, **PgUp/PgDn** — scrollback.
 
@@ -205,11 +211,11 @@ See [CHANGELOG.md](CHANGELOG.md)
 
 ## Roadmap
 
-- **SMP scheduler** — per-CPU current task exists, but inter-CPU rescheduling via IPI is not integrated into context switch
+- **SMP scheduler** — IPI reschedule works but context switch integration is partial
 - **Sound** — no driver (HDA/AC97)
 - **Dynamic linker** — only static ELF
-- **shared memory** — no mmap MAP_SHARED
-- **futex** — not implemented
+- **Shared memory** — no mmap MAP_SHARED
+- **Futex** — not implemented
 - **IRQ-driven e1000** — polling only
 - **NVMe VFS integration** — driver works but not integrated as block device in VFS
 - **epoll** — poll exists, no epoll for scalability

@@ -11,11 +11,20 @@ unsafe impl<T: Send> Sync for SpinLock<T> {}
 
 pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
+    flags: u64,
 }
 
 impl<'a, T> Drop for SpinLockGuard<'a, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
+        unsafe {
+            core::arch::asm!(
+                "push {flags}",
+                "popfq",
+                flags = in(reg) self.flags,
+                options(nostack),
+            );
+        }
     }
 }
 
@@ -41,21 +50,29 @@ impl<T> SpinLock<T> {
     }
 
     pub fn lock(&self) -> SpinLockGuard<T> {
+        let flags: u64;
+        unsafe {
+            core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
+        }
         while self.locked.compare_exchange_weak(
             false, true,
             Ordering::Acquire, Ordering::Relaxed,
         ).is_err() {
             core::hint::spin_loop();
         }
-        SpinLockGuard { lock: self }
+        SpinLockGuard { lock: self, flags }
     }
 
     pub fn try_lock(&self) -> Option<SpinLockGuard<T>> {
+        let flags: u64;
+        unsafe {
+            core::arch::asm!("pushfq; pop {}", out(reg) flags, options(nostack));
+        }
         if self.locked.compare_exchange(
             false, true,
             Ordering::Acquire, Ordering::Relaxed,
         ).is_ok() {
-            Some(SpinLockGuard { lock: self })
+            Some(SpinLockGuard { lock: self, flags })
         } else {
             None
         }

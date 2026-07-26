@@ -257,6 +257,23 @@ unsafe fn pipe_from_fd(fd: i32, is_read: bool) -> *mut PipeBuffer {
     ptr::null_mut()
 }
 
+pub unsafe fn pipe_has_data(fd: i32) -> bool {
+    let p = pipe_from_fd(fd, true);
+    if p.is_null() { return false; }
+    (*p).head != (*p).tail
+}
+
+pub unsafe fn pipe_can_write(fd: i32) -> bool {
+    let p = pipe_from_fd(fd, false);
+    if p.is_null() { return false; }
+    let next = ((*p).head + 1) % PIPE_BUF_SIZE as u32;
+    next != (*p).tail
+}
+
+pub unsafe fn is_pipe_fd(fd: i32) -> bool {
+    !pipe_from_fd(fd, true).is_null() || !pipe_from_fd(fd, false).is_null()
+}
+
 fn count_nodes_recursive(node: *mut VNode) -> u32 {
     if node.is_null() {
         return 0;
@@ -924,19 +941,85 @@ pub unsafe extern "C" fn krust_vfs_ioctl(_fd: i32, _request: u32, _arg: u64) -> 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn krust_vfs_poll(_fds: *mut i32, _nfds: u64, _timeout: i32) -> i64 {
-    -1
+pub unsafe extern "C" fn krust_vfs_poll(
+    fds_ptr: *mut PollFdEntry, nfds: u64, timeout: i32,
+) -> i64 {
+    let nfds_val = nfds as usize;
+    if fds_ptr.is_null() || nfds_val == 0 { return 0; }
+    let mut count: i64 = 0;
+    for i in 0..nfds_val {
+        let fd = (*fds_ptr.add(i)).fd;
+        if fd < 0 { continue; }
+        (*fds_ptr.add(i)).revents = 0;
+        if fd >= MAX_FDS as i32 || !fd_ref()[fd as usize].used {
+            (*fds_ptr.add(i)).revents |= 0x20; // POLLNVAL
+            count += 1;
+            continue;
+        }
+        let node = fd_ref()[fd as usize].node;
+        if !node.is_null() && (*node).type_ == 2 {
+            (*fds_ptr.add(i)).revents |= 0x1; // POLLIN — devices always readable
+            count += 1;
+        } else {
+            (*fds_ptr.add(i)).revents |= 0x1; // POLLIN for files
+            count += 1;
+        }
+    }
+    count
+}
+
+#[repr(C)]
+pub struct PollFdEntry {
+    fd: i32,
+    events: u16,
+    revents: u16,
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn krust_vfs_select(
-    _nfds: i32,
-    _readfds: *mut u8,
-    _writefds: *mut u8,
+    nfds: i32,
+    readfds: *mut u8,
+    writefds: *mut u8,
     _exceptfds: *mut u8,
     _timeout: *mut u8,
 ) -> i64 {
-    -1
+    if nfds <= 0 || nfds > 1024 { return 0; }
+    let bitmap_size = ((nfds as u32 + 7) / 8) as usize;
+    let mut count: i64 = 0;
+
+    if !readfds.is_null() {
+        for byte_idx in 0..bitmap_size {
+            let bits = *readfds.add(byte_idx);
+            for bit in 0..8 {
+                let fd = (byte_idx * 8 + bit) as i32;
+                if fd >= nfds { break; }
+                if (bits & (1 << bit)) != 0 {
+                    if fd >= 0 && fd < MAX_FDS as i32 && fd_ref()[fd as usize].used {
+                        count += 1;
+                    } else {
+                        *readfds.add(byte_idx) &= !(1 << bit);
+                    }
+                }
+            }
+        }
+    }
+    if !writefds.is_null() {
+        for byte_idx in 0..bitmap_size {
+            let bits = *writefds.add(byte_idx);
+            for bit in 0..8 {
+                let fd = (byte_idx * 8 + bit) as i32;
+                if fd >= nfds { break; }
+                if (bits & (1 << bit)) != 0 {
+                    if fd >= 0 && fd < MAX_FDS as i32 && fd_ref()[fd as usize].used {
+                        count += 1;
+                    } else {
+                        *writefds.add(byte_idx) &= !(1 << bit);
+                    }
+                }
+            }
+        }
+    }
+    count
 }
 
 #[no_mangle]
@@ -977,15 +1060,21 @@ pub unsafe extern "C" fn krust_vfs_pipe_read(fd: i32, buf: *mut u8, size: u32) -
         return -1;
     }
     let mut total: u32 = 0;
+    let mut retries = 0u32;
     while total < size {
         if (*p).head != (*p).tail {
             *buf.add(total as usize) = (*p).buf[(*p).tail as usize];
             (*p).tail = ((*p).tail + 1) % PIPE_BUF_SIZE as u32;
             total += 1;
+            retries = 0;
         } else if !(*p).write_open {
             break;
         } else {
-            break;
+            if retries > 200 {
+                break;
+            }
+            retries += 1;
+            crate::scheduler::krust_sched_yield();
         }
     }
     total as i32
@@ -998,16 +1087,22 @@ pub unsafe extern "C" fn krust_vfs_pipe_write(fd: i32, data: *const u8, size: u3
         return -1;
     }
     let mut total: u32 = 0;
+    let mut retries = 0u32;
     while total < size {
         let next = ((*p).head + 1) % PIPE_BUF_SIZE as u32;
         if next != (*p).tail {
             (*p).buf[(*p).head as usize] = *data.add(total as usize);
             (*p).head = next;
             total += 1;
+            retries = 0;
         } else if !(*p).read_open {
             break;
         } else {
-            break;
+            if retries > 200 {
+                break;
+            }
+            retries += 1;
+            crate::scheduler::krust_sched_yield();
         }
     }
     total as i32
