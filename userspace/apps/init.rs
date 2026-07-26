@@ -148,7 +148,21 @@ fn builtin_help() {
   poweroff      - Power off\n\
   kill <pid>    - Send SIGTERM\n\
   ps            - List processes\n\
-  tee <file>    - Copy stdin to file\n";
+  tee <file>    - Copy stdin to file\n\
+  free          - Memory info\n\
+  lspci         - PCI devices\n\
+  lsmem         - Memory map\n\
+  top           - Process table\n\
+  setenv k v    - Set environment\n\
+  unsetenv k    - Unset environment\n\
+  env           - Show environment\n\
+  export k=v    - Set environment\n\
+  Source: cmd1 && cmd2 (run if ok)\n\
+  Source: cmd1 || cmd2 (run if fail)\n\
+  Source: cmd1 ; cmd2 (run both)\n\
+  Source: cmd > file  (output redirect)\n\
+  Source: cmd < file  (input redirect)\n\
+  Source: cmd1 | cmd2 (pipe)\n";
     sys_write(help);
 }
 
@@ -222,7 +236,7 @@ fn builtin_cat(args: &[*const u8]) {
     }
     let path = unsafe { cstr_to_slice(args[1]) };
     let path_str = unsafe { core::str::from_utf8_unchecked(path) };
-    let mut st = FileStat { type_: 0, size: 0, name: [0u8; 64] };
+    let mut st = FileStat { type_: 0, size: 0, name: [0u8; 64], uid: 0, gid: 0, mode: 0 };
     if sys_stat(path_str, &mut st) < 0 {
         sys_write(b"cat: not found\n");
         return;
@@ -319,7 +333,7 @@ fn builtin_cp(args: &[*const u8]) {
     let dst = unsafe { core::str::from_utf8_unchecked(cstr_to_slice(args[2])) };
     let fd = sys_open(src);
     if fd < 0 { sys_write(b"cp: source not found\n"); return; }
-    let mut st = FileStat { type_: 0, size: 0, name: [0u8; 64] };
+    let mut st = FileStat { type_: 0, size: 0, name: [0u8; 64], uid: 0, gid: 0, mode: 0 };
     if sys_stat(src, &mut st) < 0 { sys_close(fd); return; }
     let mut buf = [0u8; 4096];
     let mut total = 0u32;
@@ -396,25 +410,13 @@ fn builtin_kill(args: &[*const u8]) {
 }
 
 fn builtin_ps() {
-    let pid = sys_getpid();
-    let ppid = sys_getppid();
-    let mut buf = [0u8; 64];
-    let pos = {
-        let s = b"PID: ";
-        let mut p = 0;
-        for &b in s.iter() { buf[p] = b; p += 1; }
-        if pid >= 100 { buf[p] = b'0' + (pid / 100) as u8; p += 1; }
-        if pid >= 10 { buf[p] = b'0' + ((pid / 10) % 10) as u8; p += 1; }
-        buf[p] = b'0' + (pid % 10) as u8; p += 1;
-        let s = b"  PPID: ";
-        for &b in s.iter() { buf[p] = b; p += 1; }
-        if ppid >= 100 { buf[p] = b'0' + (ppid / 100) as u8; p += 1; }
-        if ppid >= 10 { buf[p] = b'0' + ((ppid / 10) % 10) as u8; p += 1; }
-        buf[p] = b'0' + (ppid % 10) as u8; p += 1;
-        p
-    };
-    sys_write(&buf[..pos]);
-    sys_write(b"\n");
+    let mut buf = [0u8; 4096];
+    let n = sys_ps(&mut buf);
+    if n > 0 {
+        sys_write(&buf[..n as usize]);
+    } else {
+        sys_write(b"ps: failed\n");
+    }
 }
 
 fn builtin_tee(args: &[*const u8]) {
@@ -445,11 +447,158 @@ fn builtin_tee(args: &[*const u8]) {
     }
 }
 
+fn builtin_env() {
+    let mut buf = [0u8; 4096];
+    let n = sys_list_env(&mut buf);
+    if n > 0 {
+        sys_write(&buf[..n as usize]);
+    } else {
+        sys_write(b"HOME=/\nPATH=/bin:/mnt/bin\nUSER=root\n");
+    }
+}
+
+fn builtin_setenv(args: &[*const u8]) {
+    if args[1].is_null() || args[2].is_null() {
+        sys_write(b"Usage: setenv <key> <value>\n");
+        return;
+    }
+    let key = unsafe { core::str::from_utf8_unchecked(cstr_to_slice(args[1])) };
+    let val = unsafe { core::str::from_utf8_unchecked(cstr_to_slice(args[2])) };
+    if sys_setenv(key, val) < 0 {
+        sys_write(b"setenv: failed\n");
+    }
+}
+
+fn builtin_unsetenv(args: &[*const u8]) {
+    if args[1].is_null() {
+        sys_write(b"Usage: unsetenv <key>\n");
+        return;
+    }
+    let key = unsafe { core::str::from_utf8_unchecked(cstr_to_slice(args[1])) };
+    if sys_setenv(key, "") < 0 {
+        sys_write(b"unsetenv: failed\n");
+    }
+}
+
+fn builtin_export(args: &[*const u8]) {
+    if args[1].is_null() {
+        sys_write(b"Usage: export KEY=VALUE\n");
+        return;
+    }
+    let arg = unsafe { core::str::from_utf8_unchecked(cstr_to_slice(args[1])) };
+    let bytes = arg.as_bytes();
+    let mut eq_pos = bytes.len();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'=' { eq_pos = i; break; }
+    }
+    if eq_pos == bytes.len() {
+        sys_write(b"export: syntax: KEY=VALUE\n");
+        return;
+    }
+    let key = &arg[..eq_pos];
+    let val = &arg[eq_pos + 1..];
+    if sys_setenv(key, val) < 0 {
+        sys_write(b"export: failed\n");
+    }
+}
+
+fn builtin_free() {
+    let mut total: u32 = 0;
+    let mut free: u32 = 0;
+    if sys_free_info(&mut total, &mut free) < 0 {
+        sys_write(b"free: failed\n");
+        return;
+    }
+    let used = total - free;
+    sys_write(b"MemTotal:     ");
+    print_u32(total);
+    sys_write(b" kB\nMemFree:      ");
+    print_u32(free);
+    sys_write(b" kB\nMemUsed:      ");
+    print_u32(used);
+    sys_write(b" kB\n");
+}
+
+fn print_u32(val: u32) {
+    if val == 0 { sys_write(b"0"); return; }
+    let mut tmp = [0u8; 12];
+    let mut n = 0;
+    let mut v = val;
+    while v > 0 { tmp[n] = b'0' + (v % 10) as u8; v /= 10; n += 1; }
+    let mut i = n;
+    while i > 0 { i -= 1; sys_write(&[tmp[i]]); }
+}
+
+fn builtin_lspci() {
+    let path_str = "/proc/pci";
+    let fd = sys_open(path_str);
+    if fd < 0 {
+        sys_write(b"lspci: /proc/pci not available\n");
+        return;
+    }
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = sys_read(fd, &mut buf);
+        if n <= 0 { break; }
+        sys_write(&buf[..n as usize]);
+    }
+    sys_close(fd);
+}
+
+fn builtin_dmesg() {
+    let path_str = "/dev/kmsg";
+    let fd = sys_open(path_str);
+    if fd < 0 {
+        sys_write(b"dmesg: /dev/kmsg not available\n");
+        return;
+    }
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = sys_read(fd, &mut buf);
+        if n <= 0 { break; }
+        sys_write(&buf[..n as usize]);
+    }
+    sys_close(fd);
+}
+
+fn builtin_top() {
+    let mut iteration = 0u32;
+    loop {
+        if iteration > 0 {
+            sys_sleep(2000);
+        }
+        iteration += 1;
+        sys_clear();
+        let mut buf = [0u8; 4096];
+        let n = sys_ps(&mut buf);
+        if n > 0 {
+            sys_write(&buf[..n as usize]);
+        }
+        let mut total: u32 = 0;
+        let mut free: u32 = 0;
+        if sys_free_info(&mut total, &mut free) >= 0 {
+            sys_write(b"\nMem: ");
+            print_u32(total - free);
+            sys_write(b" / ");
+            print_u32(total);
+            sys_write(b" kB\n");
+        }
+        // Check for 'q' key to exit
+        // Non-blocking: just check if there's input available
+        let mut pfd = [PollFd { fd: 0, events: POLLIN, revents: 0 }];
+        sys_poll(&mut pfd, 0);
+        if pfd[0].revents & POLLIN != 0 {
+            let c = sys_getchar();
+            if c == b'q' || c == b'Q' { break; }
+        }
+    }
+}
+
 // ──── COMMAND EXECUTION ─────────────────────────────────────────
 
 fn find_exec(path: &[u8]) -> bool {
     let path_str = unsafe { core::str::from_utf8_unchecked(path) };
-    let mut st = FileStat { type_: 0, size: 0, name: [0u8; 64] };
+    let mut st = FileStat { type_: 0, size: 0, name: [0u8; 64], uid: 0, gid: 0, mode: 0 };
     sys_stat(path_str, &mut st) >= 0
 }
 
@@ -481,20 +630,143 @@ fn run_command(cmd_line: &[u8]) {
     let argc = parse_line(cmd_line, &mut args);
 
     if argc == 0 { return; }
-    let cmd = unsafe { cstr_to_slice(args[0]) };
 
-    /* Check for pipe */
-    let mut pipe_idx = cmd_line.len();
+    /* Check for ; command chaining */
     for (i, &b) in cmd_line.iter().enumerate() {
-        if b == b'|' { pipe_idx = i; break; }
+        if b == b';' {
+            let mut left = [0u8; MAX_CMD];
+            let mut right = [0u8; MAX_CMD];
+            let mut lpos = 0;
+            for &x in cmd_line[..i].iter() {
+                if lpos >= left.len() - 1 { break; }
+                left[lpos] = x;
+                lpos += 1;
+            }
+            left[lpos] = 0;
+            while lpos > 0 && left[lpos-1] == b' ' { lpos -= 1; left[lpos] = 0; }
+
+            let mut rpos = 0;
+            for &x in cmd_line[i+1..].iter() {
+                if rpos >= right.len() - 1 { break; }
+                right[rpos] = x;
+                rpos += 1;
+            }
+            right[rpos] = 0;
+            while rpos > 0 && right[rpos-1] == b' ' { rpos -= 1; right[rpos] = 0; }
+
+            if lpos > 0 { run_command(&left[..lpos]); }
+            if rpos > 0 { run_command(&right[..rpos]); }
+            return;
+        }
     }
 
-    if pipe_idx < cmd_line.len() {
-        /* Handle pipe: cmd1 | cmd2 */
+    /* Check for && command chaining */
+    for (i, &b) in cmd_line.iter().enumerate() {
+        if i + 1 < cmd_line.len() && b == b'&' && cmd_line[i+1] == b'&' {
+            let mut left = [0u8; MAX_CMD];
+            let mut right = [0u8; MAX_CMD];
+            let mut lpos = 0;
+            for &x in cmd_line[..i].iter() {
+                if lpos >= left.len() - 1 { break; }
+                left[lpos] = x;
+                lpos += 1;
+            }
+            left[lpos] = 0;
+            while lpos > 0 && left[lpos-1] == b' ' { lpos -= 1; left[lpos] = 0; }
+
+            let mut rpos = 0;
+            for &x in cmd_line[i+2..].iter() {
+                if rpos >= right.len() - 1 { break; }
+                right[rpos] = x;
+                rpos += 1;
+            }
+            right[rpos] = 0;
+            while rpos > 0 && right[rpos-1] == b' ' { rpos -= 1; right[rpos] = 0; }
+
+            if lpos > 0 {
+                let pid = sys_fork();
+                if pid == 0 {
+                    run_command(&left[..lpos]);
+                    sys_exit();
+                } else if pid > 0 {
+                    let mut stat = 0i32;
+                    sys_waitpid(pid, &mut stat);
+                    if stat == 0 && rpos > 0 {
+                        run_command(&right[..rpos]);
+                    } else if stat != 0 {
+                        return;
+                    }
+                }
+            } else if rpos > 0 {
+                run_command(&right[..rpos]);
+            }
+            return;
+        }
+    }
+
+    let cmd = unsafe { cstr_to_slice(args[0]) };
+
+    let mut output_redir: Option<[u8; 256]> = None;
+    let mut input_redir: Option<[u8; 256]> = None;
+    let mut append_redir: bool = false;
+    let mut cmd_end = cmd_line.len();
+    let mut pipe_idx = cmd_line.len();
+    let mut i = 0;
+    while i < cmd_line.len() {
+        if cmd_line[i] == b'>' {
+            if i + 1 < cmd_line.len() && cmd_line[i+1] == b'>' {
+                append_redir = true;
+                let mut path = [0u8; 256];
+                let mut j = i + 2;
+                while j < cmd_line.len() && cmd_line[j] == b' ' { j += 1; }
+                let mut k = 0;
+                while j < cmd_line.len() && cmd_line[j] != b' ' && cmd_line[j] != b';' && cmd_line[j] != b'|' && k < 255 {
+                    path[k] = cmd_line[j]; k += 1; j += 1;
+                }
+                path[k] = 0;
+                output_redir = Some(path);
+                if cmd_end > i { cmd_end = i; }
+                break;
+            } else {
+                let mut path = [0u8; 256];
+                let mut j = i + 1;
+                while j < cmd_line.len() && cmd_line[j] == b' ' { j += 1; }
+                let mut k = 0;
+                while j < cmd_line.len() && cmd_line[j] != b' ' && cmd_line[j] != b';' && cmd_line[j] != b'|' && k < 255 {
+                    path[k] = cmd_line[j]; k += 1; j += 1;
+                }
+                path[k] = 0;
+                output_redir = Some(path);
+                if cmd_end > i { cmd_end = i; }
+                break;
+            }
+        } else if cmd_line[i] == b'<' {
+            let mut path = [0u8; 256];
+            let mut j = i + 1;
+            while j < cmd_line.len() && cmd_line[j] == b' ' { j += 1; }
+            let mut k = 0;
+            while j < cmd_line.len() && cmd_line[j] != b' ' && cmd_line[j] != b';' && cmd_line[j] != b'|' && k < 255 {
+                path[k] = cmd_line[j]; k += 1; j += 1;
+            }
+            path[k] = 0;
+            input_redir = Some(path);
+            if cmd_end > i { cmd_end = i; }
+            break;
+        } else if cmd_line[i] == b'|' {
+            if pipe_idx == cmd_line.len() {
+                pipe_idx = i;
+            }
+        }
+        i += 1;
+    }
+
+    let trimmed_cmd_line = &cmd_line[..cmd_end];
+
+    if pipe_idx < trimmed_cmd_line.len() {
         let mut left = [0u8; MAX_CMD];
         let mut right = [0u8; MAX_CMD];
-        let (l, r) = cmd_line.split_at(pipe_idx);
-        let r = &r[1..]; /* skip | */
+        let (l, r) = trimmed_cmd_line.split_at(pipe_idx);
+        let r = &r[1..];
 
         let mut lpos = 0;
         for &b in l.iter() {
@@ -512,7 +784,6 @@ fn run_command(cmd_line: &[u8]) {
         }
         right[rpos] = 0;
 
-        /* Trim */
         while lpos > 0 && left[lpos-1] == b' ' { lpos -= 1; left[lpos] = 0; }
         let mut rstart = 0;
         while rstart < rpos && right[rstart] == b' ' { rstart += 1; }
@@ -531,13 +802,9 @@ fn run_command(cmd_line: &[u8]) {
             return;
         }
 
-        let l_args = unsafe { core::str::from_utf8_unchecked(left_cmd) };
-        let r_args = unsafe { core::str::from_utf8_unchecked(right_cmd) };
-
         let l_argv: [*const u8; 2] = [left_cmd.as_ptr(), core::ptr::null()];
         let r_argv: [*const u8; 2] = [right_cmd.as_ptr(), core::ptr::null()];
 
-        /* Fork for left command */
         let left_pid = sys_fork();
         if left_pid < 0 {
             sys_write(b"pipe: fork failed\n");
@@ -547,20 +814,16 @@ fn run_command(cmd_line: &[u8]) {
         }
 
         if left_pid == 0 {
-            /* Child: redirect stdout to pipe write end */
             sys_pipe_close(fds[0]);
             sys_dup2(fds[1], 1);
             sys_pipe_close(fds[1]);
-            /* Run left command */
             run_command(left_cmd);
             sys_exit();
         }
 
         if left_pid > 0 {
-            /* Parent: run right command, reading from pipe */
             sys_pipe_close(fds[1]);
             let mut status = 0i32;
-            /* Fork for right command */
             let right_pid = sys_fork();
             if right_pid == 0 {
                 sys_dup2(fds[0], 0);
@@ -575,48 +838,40 @@ fn run_command(cmd_line: &[u8]) {
         return;
     }
 
-    /* Check for output redirection */
-    let mut redir_idx = cmd_line.len();
-    for (i, &b) in cmd_line.iter().enumerate() {
-        if b == b'>' { redir_idx = i; break; }
-    }
+    if !output_redir.is_none() || !input_redir.is_none() {
+        let mut new_args: [*const u8; MAX_ARGS] = [core::ptr::null(); MAX_ARGS];
+        let new_argc = parse_line(trimmed_cmd_line, &mut new_args);
+        if new_argc == 0 { return; }
+        let new_cmd = unsafe { cstr_to_slice(new_args[0]) };
+        let path = if !output_redir.is_none() { output_redir.as_ref().unwrap() } else { input_redir.as_ref().unwrap() };
+        let is_output = !output_redir.is_none();
 
-    if redir_idx < cmd_line.len() {
-        let mut cmd_part = [0u8; MAX_CMD];
-        let mut file_part = [0u8; MAX_PATH];
-        let (l, r) = cmd_line.split_at(redir_idx);
-        let r = &r[1..];
-
-        let mut cpos = 0;
-        for &b in l.iter() {
-            if cpos >= cmd_part.len() - 1 { break; }
-            cmd_part[cpos] = b;
-            cpos += 1;
-        }
-        cmd_part[cpos] = 0;
-        while cpos > 0 && cmd_part[cpos-1] == b' ' { cpos -= 1; cmd_part[cpos] = 0; }
-
-        let mut fpos = 0;
-        for &b in r.iter() {
-            if fpos >= file_part.len() - 1 { break; }
-            file_part[fpos] = b;
-            fpos += 1;
-        }
-        file_part[fpos] = 0;
-        let mut fstart = 0;
-        while fstart < fpos && file_part[fstart] == b' ' { fstart += 1; }
-
-        if cpos == 0 || fstart >= fpos {
-            sys_write(b"Usage: cmd > file\n");
+        let path_str = unsafe { core::str::from_utf8_unchecked(path) };
+        let fd = sys_open(path_str);
+        if fd < 0 {
+            sys_write(b"redir: cannot open\n");
             return;
         }
-
-        let cmd_s = &cmd_part[..cpos];
-        let file_s = unsafe { core::str::from_utf8_unchecked(&file_part[fstart..fpos]) };
-
-        /* Fork, redirect stdout to file */
-        /* Simple approach: just try to run the command without redirection */
-        sys_write(b"redir: feature not available in userspace yet\n");
+        let fd = fd as i32;
+        let pid = sys_fork();
+        if pid == 0 {
+            if is_output {
+                sys_dup2(fd, 1);
+                sys_dup2(fd, 2);
+            } else {
+                sys_dup2(fd, 0);
+            }
+            if !try_exec(new_cmd, &new_args) {
+                sys_write(b"init: command not found: ");
+                let cmd_str = unsafe { core::str::from_utf8_unchecked(new_cmd) };
+                sys_write(cmd_str.as_bytes());
+                sys_write(b"\n");
+            }
+            sys_exit();
+        } else if pid > 0 {
+            let mut stat = 0i32;
+            sys_waitpid(pid, &mut stat);
+        }
         return;
     }
 
@@ -699,6 +954,42 @@ fn run_command(cmd_line: &[u8]) {
     }
     if str_cmp(cmd_str, "tee") {
         builtin_tee(&args);
+        return;
+    }
+    if str_cmp(cmd_str, "env") {
+        builtin_env();
+        return;
+    }
+    if str_cmp(cmd_str, "setenv") {
+        builtin_setenv(&args);
+        return;
+    }
+    if str_cmp(cmd_str, "unsetenv") {
+        builtin_unsetenv(&args);
+        return;
+    }
+    if str_cmp(cmd_str, "export") {
+        builtin_export(&args);
+        return;
+    }
+    if str_cmp(cmd_str, "free") {
+        builtin_free();
+        return;
+    }
+    if str_cmp(cmd_str, "lspci") {
+        builtin_lspci();
+        return;
+    }
+    if str_cmp(cmd_str, "dmesg") {
+        builtin_dmesg();
+        return;
+    }
+    if str_cmp(cmd_str, "top") {
+        builtin_top();
+        return;
+    }
+    if str_cmp(cmd_str, "uptime") {
+        builtin_uname();
         return;
     }
 

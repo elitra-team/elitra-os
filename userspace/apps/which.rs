@@ -5,7 +5,7 @@ include!("../src/rt.rs");
 
 fn path_exists(path: &[u8]) -> bool {
     let s = core::str::from_utf8(path).unwrap_or("");
-    let mut st = FileStat { type_: 0, size: 0, name: [0u8; 64] };
+    let mut st = FileStat { type_: 0, size: 0, name: [0u8; 64], uid: 0, gid: 0, mode: 0 };
     sys_stat(s, &mut st) == 0
 }
 
