@@ -247,6 +247,9 @@ pub struct FileStat {
     pub type_: u8,
     pub size: u32,
     pub name: [u8; 64],
+    pub uid: u16,
+    pub gid: u16,
+    pub mode: u16,
 }
 
 pub fn sys_stat(path: &str, st: &mut FileStat) -> isize {
@@ -258,63 +261,126 @@ pub fn sys_stat(path: &str, st: &mut FileStat) -> isize {
     if r == 0xFFFFFFFF { -1 } else { 0 }
 }
 
-// --- Bump allocator ---
+// --- First-fit free-list allocator ---
 
 static mut HEAP_BASE: *mut u8 = core::ptr::null_mut();
-static mut HEAP_PTR: *mut u8 = core::ptr::null_mut();
 static mut HEAP_END: *mut u8 = core::ptr::null_mut();
 
-static mut LAST_ALLOC_PTR: *mut u8 = core::ptr::null_mut();
-static mut LAST_ALLOC_SIZE: usize = 0;
+#[repr(C)]
+struct BlockHeader {
+    size: u32,     // total block size including header (always 8-byte aligned)
+    free: bool,
+    next: *mut BlockHeader,
+}
+
+const HDR_SIZE: usize = core::mem::size_of::<BlockHeader>();
+const ALIGN8: usize = !7usize;
+
+static mut FREE_LIST: *mut BlockHeader = core::ptr::null_mut();
+static mut ALLOC_PTR: *mut u8 = core::ptr::null_mut(); // bump pointer for new blocks
+
+unsafe fn align_up(v: usize, a: usize) -> usize { (v + a - 1) & !(a - 1) }
+
+unsafe fn extend_heap(need: usize) -> *mut BlockHeader {
+    let chunk = align_up(need + HDR_SIZE, 4096);
+    if ALLOC_PTR.add(chunk) > HEAP_END { return core::ptr::null_mut(); }
+    let blk = ALLOC_PTR as *mut BlockHeader;
+    (*blk).size = chunk as u32;
+    (*blk).free = true;
+    (*blk).next = FREE_LIST;
+    FREE_LIST = blk;
+    ALLOC_PTR = ALLOC_PTR.add(chunk);
+    blk
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn heap_init(base: *mut u8, size: usize) {
     HEAP_BASE = base;
-    HEAP_PTR = base;
     HEAP_END = base.add(size);
-    LAST_ALLOC_PTR = core::ptr::null_mut();
-    LAST_ALLOC_SIZE = 0;
+    ALLOC_PTR = base;
+    FREE_LIST = core::ptr::null_mut();
+    // Create one initial free block spanning the entire heap
+    let blk = base as *mut BlockHeader;
+    (*blk).size = size as u32;
+    (*blk).free = true;
+    (*blk).next = core::ptr::null_mut();
+    FREE_LIST = blk;
+    ALLOC_PTR = base.add(size);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn malloc(size: usize) -> *mut u8 {
     if size == 0 { return core::ptr::null_mut(); }
-    let aligned = (size + 7) & !7;
-    let ptr = HEAP_PTR;
-    if ptr.add(aligned) > HEAP_END { return core::ptr::null_mut(); }
-    HEAP_PTR = ptr.add(aligned);
-    LAST_ALLOC_PTR = ptr;
-    LAST_ALLOC_SIZE = size;
-    ptr
+    let need = align_up(size + HDR_SIZE, 8);
+    // First-fit search
+    let mut cur = FREE_LIST;
+    while !cur.is_null() {
+        if (*cur).free && (*cur).size as usize >= need {
+            // Split block if remainder is large enough
+            let remainder = (*cur).size as usize - need;
+            if remainder >= HDR_SIZE + 8 {
+                let new_blk = (cur as *mut u8).add(need) as *mut BlockHeader;
+                (*new_blk).size = remainder as u32;
+                (*new_blk).free = true;
+                (*new_blk).next = (*cur).next;
+                (*cur).next = new_blk;
+                (*cur).size = need as u32;
+            }
+            (*cur).free = false;
+            return (cur as *mut u8).add(HDR_SIZE);
+        }
+        cur = (*cur).next;
+    }
+    // No suitable block found, extend heap
+    let blk = extend_heap(size);
+    if blk.is_null() { return core::ptr::null_mut(); }
+    (*blk).free = false;
+    // Split if possible
+    let total = (*blk).size as usize;
+    if total > need + HDR_SIZE + 8 {
+        let new_blk = (blk as *mut u8).add(need) as *mut BlockHeader;
+        (*new_blk).size = (total - need) as u32;
+        (*new_blk).free = true;
+        (*new_blk).next = (*blk).next;
+        (*blk).next = new_blk;
+        (*blk).size = need as u32;
+    }
+    (blk as *mut u8).add(HDR_SIZE)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn free(_ptr: *mut u8) {
-    // Bump allocator: free is a no-op (memory is recycled on full reset)
+pub unsafe extern "C" fn free(ptr: *mut u8) {
+    if ptr.is_null() { return; }
+    let hdr = (ptr.sub(HDR_SIZE)) as *mut BlockHeader;
+    (*hdr).free = true;
+    // Coalesce with next block if free
+    let next = (*hdr).next;
+    if !next.is_null() && (*next).free {
+        (*hdr).size += (*next).size;
+        (*hdr).next = (*next).next;
+    }
+    // Coalesce with previous block (linear scan, acceptable for hobby OS)
+    let mut prev = FREE_LIST;
+    while !prev.is_null() && (*prev).next != hdr {
+        prev = (*prev).next;
+    }
+    if !prev.is_null() && prev != hdr && (*prev).free {
+        (*prev).size += (*hdr).size;
+        (*prev).next = (*hdr).next;
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn realloc(ptr: *mut u8, size: usize) -> *mut u8 {
     if ptr.is_null() { return malloc(size); }
     if size == 0 { free(ptr); return core::ptr::null_mut(); }
-    // Fast path: realloc the last allocation in-place
-    if ptr == LAST_ALLOC_PTR {
-        let aligned = (size + 7) & !7;
-        let new_end = ptr.add(aligned);
-        if new_end <= HEAP_END {
-            HEAP_PTR = new_end;
-            LAST_ALLOC_SIZE = size;
-            return ptr;
-        }
-    }
+    let hdr = (ptr.sub(HDR_SIZE)) as *mut BlockHeader;
+    let old_usable = (*hdr).size as usize - HDR_SIZE;
+    if old_usable >= size { return ptr; }
     let newp = malloc(size);
-    if !newp.is_null() && newp != ptr {
-        if ptr == LAST_ALLOC_PTR {
-            let copy_size = if LAST_ALLOC_SIZE < size { LAST_ALLOC_SIZE } else { size };
-            core::ptr::copy_nonoverlapping(ptr, newp, copy_size);
-        }
-        // For non-last allocations: original size unknown in bump allocator,
-        // cannot safely copy. Caller must re-fill the buffer.
+    if !newp.is_null() {
+        core::ptr::copy_nonoverlapping(ptr, newp, old_usable);
+        free(ptr);
     }
     newp
 }
@@ -809,5 +875,123 @@ pub struct LinuxDirent64 {
 
 pub fn sys_getdents(fd: i32, buf: &mut [u8], count: usize) -> isize {
     let r = unsafe { syscall_3(78, fd as u32, buf.as_mut_ptr() as u32, count as u32) };
+    if r == 0xFFFFFFFF { -1 } else { r as isize }
+}
+
+pub fn sys_symlink(target: &str, linkpath: &str) -> isize {
+    let t_bytes = target.as_bytes();
+    let l_bytes = linkpath.as_bytes();
+    if t_bytes.len() >= 254 || l_bytes.len() >= 254 { return -1; }
+    let mut t_buf = [0u8; 256];
+    t_buf[..t_bytes.len()].copy_from_slice(t_bytes);
+    let mut l_buf = [0u8; 256];
+    l_buf[..l_bytes.len()].copy_from_slice(l_bytes);
+    let r = unsafe { syscall_2(79, &t_buf as *const _ as u32, &l_buf as *const _ as u32) };
+    if r == 0xFFFFFFFF { -1 } else { 0 }
+}
+
+pub fn sys_readlink(path: &str, buf: &mut [u8]) -> isize {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 254 { return -1; }
+    let mut cpath = [0u8; 256];
+    cpath[..bytes.len()].copy_from_slice(bytes);
+    let r = unsafe { syscall_3(80, &cpath as *const _ as u32, buf.as_mut_ptr() as u32, buf.len() as u32) };
+    if r == 0xFFFFFFFF { -1 } else { r as isize }
+}
+
+pub fn sys_lseek(fd: isize, offset: isize, whence: i32) -> isize {
+    let r = unsafe { syscall_3(40, fd as u32, offset as u32, whence as u32) };
+    if r == 0xFFFFFFFF { -1 } else { r as isize }
+}
+
+pub fn sys_brk(addr: u64) -> u64 {
+    let r = unsafe { syscall_2(38, addr as u32, 0) };
+    r as u64
+}
+
+pub fn sys_dup(fd: i32) -> isize {
+    let r = unsafe { syscall_2(41, fd as u32, 0) };
+    if r == 0xFFFFFFFF { -1 } else { r as isize }
+}
+
+pub fn sys_fcntl(fd: i32, cmd: i32, arg: u32) -> isize {
+    let r = unsafe { syscall_3(42, fd as u32, cmd as u32, arg) };
+    if r == 0xFFFFFFFF { -1 } else { r as isize }
+}
+
+pub fn sys_mmap(addr: u64, length: u32, prot: u32, flags: u32, fd: i32, offset: u32) -> isize {
+    let r = unsafe { syscall_5(36, addr as u32, length, prot, flags, fd as u32) };
+    if r == 0xFFFFFFFF { -1 } else { r as isize }
+}
+
+pub fn sys_munmap(addr: u64, length: u32) -> isize {
+    let r = unsafe { syscall_3(37, addr as u32, length, 0) };
+    if r == 0xFFFFFFFF { -1 } else { 0 }
+}
+
+pub fn sys_select(nfds: i32, readfds: *mut u8, writefds: *mut u8, exceptfds: *mut u8, timeout: *mut u8) -> isize {
+    let r = unsafe { syscall_5(45, nfds as u32, readfds as u32, writefds as u32, exceptfds as u32, timeout as u32) };
+    if r == 0xFFFFFFFF { -1 } else { r as isize }
+}
+
+pub fn sys_getdirentries(fd: i32, buf: &mut [u8]) -> isize {
+    sys_getdents(fd, buf, buf.len())
+}
+
+pub fn sys_setenv(name: &str, value: &str) -> isize {
+    let n = name.as_bytes();
+    let v = value.as_bytes();
+    if n.len() >= 64 || v.len() >= 256 { return -1; }
+    let mut nbuf = [0u8; 64];
+    nbuf[..n.len()].copy_from_slice(n);
+    let mut vbuf = [0u8; 256];
+    vbuf[..v.len()].copy_from_slice(v);
+    let r = unsafe { syscall_3(82, &nbuf as *const _ as u32, &vbuf as *const _ as u32, 0) };
+    if r == 0xFFFFFFFF { -1 } else { 0 }
+}
+
+pub fn sys_getenv(name: &str, buf: &mut [u8]) -> isize {
+    let n = name.as_bytes();
+    if n.len() >= 64 { return -1; }
+    let mut nbuf = [0u8; 64];
+    nbuf[..n.len()].copy_from_slice(n);
+    let r = unsafe { syscall_3(83, &nbuf as *const _ as u32, buf.as_mut_ptr() as u32, buf.len() as u32) };
+    if r == 0xFFFFFFFF { -1 } else { r as isize }
+}
+
+pub fn sys_getenv_ptr(name: &str, buf: *mut u8, bufsize: u32) -> isize {
+    let n = name.as_bytes();
+    if n.len() >= 64 { return -1; }
+    let mut nbuf = [0u8; 64];
+    nbuf[..n.len()].copy_from_slice(n);
+    let r = unsafe { syscall_3(83, &nbuf as *const _ as u32, buf as u32, bufsize) };
+    if r == 0xFFFFFFFF { -1 } else { r as isize }
+}
+
+// --- Syscall 84: ps (list processes) ---
+
+pub fn sys_ps(buf: &mut [u8]) -> isize {
+    let r = unsafe { syscall_3(84, buf.as_mut_ptr() as u32, buf.len() as u32, buf.len() as u32) };
+    if r == 0xFFFFFFFF { -1 } else { r as isize }
+}
+
+// --- Syscall 85: free_info(total_kb, free_kb) ---
+
+pub fn sys_free_info(total: &mut u32, free: &mut u32) -> isize {
+    let r = unsafe { syscall_3(85, total as *mut _ as u32, free as *mut _ as u32, 0) };
+    if r == 0xFFFFFFFF { -1 } else { 0 }
+}
+
+// --- Syscall 86: list_env(buf, bufsize) ---
+
+pub fn sys_list_env(buf: &mut [u8]) -> isize {
+    let r = unsafe { syscall_3(86, buf.as_mut_ptr() as u32, buf.len() as u32, buf.len() as u32) };
+    if r == 0xFFFFFFFF { -1 } else { r as isize }
+}
+
+// --- Syscall 87: proc_info(pid, buf, bufsize) ---
+
+pub fn sys_proc_info(pid: u32, buf: &mut [u8]) -> isize {
+    let r = unsafe { syscall_3(87, pid, buf.as_mut_ptr() as u32, buf.len() as u32) };
     if r == 0xFFFFFFFF { -1 } else { r as isize }
 }

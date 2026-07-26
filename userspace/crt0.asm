@@ -10,3 +10,5 @@ _start:
     call rust_main
     mov eax, 1
     int 0x80
+
+section .note.GNU-stack noalloc noexec nowrite progbits

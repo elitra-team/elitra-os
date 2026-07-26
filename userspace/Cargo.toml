@@ -106,3 +106,127 @@ path = "apps/env.rs"
 [[bin]]
 name = "init"
 path = "apps/init.rs"
+
+[[bin]]
+name = "ping"
+path = "apps/ping.rs"
+
+[[bin]]
+name = "halt"
+path = "apps/halt.rs"
+
+[[bin]]
+name = "reboot"
+path = "apps/reboot.rs"
+
+[[bin]]
+name = "shutdown"
+path = "apps/shutdown.rs"
+
+[[bin]]
+name = "ln"
+path = "apps/ln.rs"
+
+[[bin]]
+name = "date"
+path = "apps/date.rs"
+
+[[bin]]
+name = "chmod"
+path = "apps/chmod.rs"
+
+[[bin]]
+name = "id"
+path = "apps/id.rs"
+
+[[bin]]
+name = "whoami"
+path = "apps/whoami.rs"
+
+[[bin]]
+name = "head"
+path = "apps/head.rs"
+
+[[bin]]
+name = "tail"
+path = "apps/tail.rs"
+
+[[bin]]
+name = "wc"
+path = "apps/wc.rs"
+
+[[bin]]
+name = "find"
+path = "apps/find.rs"
+
+[[bin]]
+name = "grep"
+path = "apps/grep.rs"
+
+[[bin]]
+name = "df"
+path = "apps/df.rs"
+
+[[bin]]
+name = "du"
+path = "apps/du.rs"
+
+[[bin]]
+name = "diff"
+path = "apps/diff.rs"
+
+[[bin]]
+name = "sort"
+path = "apps/sort.rs"
+
+[[bin]]
+name = "tr"
+path = "apps/tr.rs"
+
+[[bin]]
+name = "cut"
+path = "apps/cut.rs"
+
+[[bin]]
+name = "xargs"
+path = "apps/xargs.rs"
+
+[[bin]]
+name = "strace"
+path = "apps/strace.rs"
+
+[[bin]]
+name = "mount"
+path = "apps/mount.rs"
+
+[[bin]]
+name = "umount"
+path = "apps/umount.rs"
+
+[[bin]]
+name = "lsof"
+path = "apps/lsof.rs"
+
+[[bin]]
+name = "kill"
+path = "apps/kill.rs"
+
+[[bin]]
+name = "free"
+path = "apps/free.rs"
+
+[[bin]]
+name = "nproc"
+path = "apps/nproc.rs"
+
+[[bin]]
+name = "uptime"
+path = "apps/uptime.rs"
+
+[[bin]]
+name = "test_cmd"
+path = "apps/test_cmd.rs"
+
+[[bin]]
+name = "procinfo"
+path = "apps/procinfo.rs"
